@@ -1,0 +1,52 @@
+[project]
+name = "primitive-sandbox-run"
+version = "1.0.0"
+description = "The Unicon sandbox-run primitive: run a binary once per test and measure each run."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.14"
+dependencies = []
+
+[project.urls]
+Source = "https://github.com/uniconhq/primitive-sandbox-run"
+
+# The program is one file with no dependencies, copied into the image as it is.
+# These are the tools that check it.
+[dependency-groups]
+dev = [
+    "jsonschema==4.26.0",
+    "mypy==2.3.1",
+    "pytest==9.1.1",
+    "pyyaml==6.0.3",
+    "ruff==0.16.7",
+    "types-jsonschema==4.26.0.20260518",
+    "types-pyyaml==6.0.12.20250915",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 88
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "PTH", "RUF"]
+
+# The program runs only in the Linux image, so it is checked as Linux code
+# wherever mypy runs.
+[tool.mypy]
+python_version = "3.14"
+platform = "linux"
+strict = true
+files = ["src", "tests", "scripts"]
+mypy_path = ["src", "scripts", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "scripts", "tests"]
+addopts = "-q"
+markers = [
+    "image: builds the image and runs it on Docker under the harness's sandbox flags",
+]
