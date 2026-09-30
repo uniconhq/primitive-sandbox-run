@@ -1,0 +1,19 @@
+name: unicon/sandbox-run
+version: v1
+entrypoint: [/usr/local/bin/sandbox-run]
+batch: true
+limits: {time_ms: 5000, cpu_ms: 5000, memory_mb: 256, pids: 128, output_mb: 64}
+limits_from:
+  time_ms: {input: time_limit, scale: 2000, add: 3000}
+  cpu_ms: {input: time_limit, scale: 2000, add: 3000}
+  memory_mb: {input: memory_limit, scale: 1, add: 256}
+inputs:
+  binary: {type: file}
+  input: {type: file}
+  time_limit: {type: number}
+  memory_limit: {type: number}
+outputs:
+  output: {type: file}
+  time_ms: {type: number}
+  memory_kb: {type: number}
+  outcome: {type: outcome}

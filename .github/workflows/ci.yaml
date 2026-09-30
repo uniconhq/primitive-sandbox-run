@@ -1,0 +1,89 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# The runner release whose primitive.schema.json this primitive is built
+# against. primitive.yaml, and every inputs.json and outputs.json the tests
+# write or read, are checked against that file.
+env:
+  RUNNER_RELEASE: v0.3.0
+  SCHEMA_URL: https://github.com/uniconhq/runner/releases/download
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "0.12.13"
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run ruff format --check .
+      - run: uv run ruff check .
+      - run: uv run mypy
+      - name: Fetch the primitive contract
+        run: >-
+          curl --fail --silent --show-error --location
+          --output "$RUNNER_TEMP/primitive.schema.json"
+          "$SCHEMA_URL/$RUNNER_RELEASE/primitive.schema.json"
+      # The repo's file has no image line; the check fills in a placeholder
+      # digest, as bootstrap later fills in the real one.
+      - run: uv run python scripts/check_declaration.py "$RUNNER_TEMP/primitive.schema.json"
+      - run: uv run pytest -m "not image"
+        env:
+          PRIMITIVE_SCHEMA: ${{ runner.temp }}/primitive.schema.json
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "0.12.13"
+          enable-cache: true
+      - run: uv sync --locked
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: false
+          load: true
+          tags: primitive-sandbox-run:ci
+      # Native and Java test binaries come from the compile primitive itself,
+      # so these tests are also the check that the two agree on the binary
+      # format. Its main branch is the version that will ship next to this one.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: uniconhq/primitive-compile
+          ref: main
+          path: primitive-compile
+          persist-credentials: false
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: primitive-compile
+          push: false
+          load: true
+          tags: primitive-compile:ci
+      - name: Fetch the primitive contract
+        run: >-
+          curl --fail --silent --show-error --location
+          --output "$RUNNER_TEMP/primitive.schema.json"
+          "$SCHEMA_URL/$RUNNER_RELEASE/primitive.schema.json"
+      # Runs the image under the same sandbox flags the harness uses: no
+      # network, read-only root, no capabilities, seccomp, user 65532.
+      - run: uv run pytest -m image
+        env:
+          PRIMITIVE_IMAGE: primitive-sandbox-run:ci
+          COMPILE_IMAGE: primitive-compile:ci
+          PRIMITIVE_SCHEMA: ${{ runner.temp }}/primitive.schema.json
