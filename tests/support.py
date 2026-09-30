@@ -1,0 +1,224 @@
+"""What the tests share: the declaration, the sandbox flags and test inputs."""
+
+import json
+import zipapp
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+ROOT = Path(__file__).resolve().parent.parent
+NAME = "primitive-sandbox-run"
+SIBLING_SCHEMA = ROOT.parent / "runner" / "schemas" / "primitive.schema.json"
+SIBLING_COMPILE = ROOT.parent / "primitive-compile"
+
+RunImage = Callable[..., dict[str, Any]]
+Check = Callable[[dict[str, Any], str], None]
+Compiled = Callable[[str, str, str], bytes]
+
+
+def declaration() -> dict[str, Any]:
+    """This repo's primitive.yaml."""
+    document: dict[str, Any] = yaml.safe_load((ROOT / "primitive.yaml").read_text())
+    return document
+
+
+def container_limits(
+    time_limit: float, memory_limit: float, items: int
+) -> dict[str, int]:
+    """The container limits the harness gives a batch, from the declaration.
+
+    Each limit is raised by `limits_from` for the item's inputs; a batch's
+    time and CPU are the per-item value times the number of items.
+    """
+    document = declaration()
+    inputs = {"time_limit": time_limit, "memory_limit": memory_limit}
+    limits: dict[str, int] = {}
+    for name, value in document["limits"].items():
+        rule = document.get("limits_from", {}).get(name)
+        if rule:
+            value = max(value, int(inputs[rule["input"]] * rule["scale"] + rule["add"]))
+        limits[name] = value * items if name in ("time_ms", "cpu_ms") else value
+    return limits
+
+
+def sandbox_flags(limits: dict[str, int]) -> list[str]:
+    """The docker run flags the harness gives a step container."""
+    memory = f"{limits['memory_mb']}m"
+    return [
+        "--network=none",
+        "--read-only",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
+        "--security-opt=seccomp=builtin",
+        "--user=65532:65532",
+        f"--memory={memory}",
+        f"--memory-swap={memory}",
+        f"--pids-limit={limits['pids']}",
+        "--cpus=1",
+        "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=64m",
+    ]
+
+
+def open_up(work: Path) -> None:
+    """Let user 65532 in the container write the working directory and read `in/`."""
+    for path in [work, *work.rglob("*")]:
+        path.chmod(0o777 if path.is_dir() else 0o666)
+
+
+def python_binary(path: Path, source: str) -> Path:
+    """Build a Python binary the way the compile primitive does."""
+    app = path.parent / (path.name + ".app")
+    app.mkdir(parents=True)
+    (app / "__main__.py").write_text(source)
+    zipapp.create_archive(app, path, interpreter="/usr/bin/env python3")
+    return path
+
+
+def batch_inputs(
+    work: Path,
+    binary: bytes,
+    items: list[tuple[str, str]],
+    time_limit: float = 1.0,
+    memory_limit: float = 64,
+) -> None:
+    """Write inputs.json, the binary and one input per item under `in/`.
+
+    `items` are (id, standard input) pairs, all run under the same limits.
+    """
+    (work / "in" / "1").mkdir(parents=True)
+    (work / "in" / "1" / "binary").write_bytes(binary)
+    (work / "in" / "2").mkdir()
+    batch = []
+    for item_id, stdin in items:
+        (work / "in" / "2" / f"{item_id}.in").write_text(stdin)
+        batch.append(
+            {
+                "id": item_id,
+                "inputs": {
+                    "binary": {"file": "in/1/binary"},
+                    "input": {"file": f"in/2/{item_id}.in"},
+                    "time_limit": time_limit,
+                    "memory_limit": memory_limit,
+                },
+            }
+        )
+    document = {"schema_version": 3, "step": "run", "batch": batch}
+    (work / "inputs.json").write_text(json.dumps(document))
+
+
+def peek_input(work: str) -> str:
+    """The standard input of a `peek` run after a run named `first`: the paths
+    it tries to read, which are the other run's output and input, the step's
+    own files and directories, the rest of /tmp, and one system file.
+    """
+    paths = [
+        f"{work}/out/first/output",
+        f"{work}/in/2/first.in",
+        f"{work}/inputs.json",
+        f"{work}/out",
+        work,
+        "/tmp",
+        "/etc/os-release",
+    ]
+    return "\n".join(["peek", *paths, ""])
+
+
+def peeked(work: str) -> list[str]:
+    """What a `peek` run prints when only the system file can be read."""
+    return [
+        f"refused {work}/out/first/output 13",
+        f"refused {work}/in/2/first.in 13",
+        f"refused {work}/inputs.json 13",
+        f"refused {work}/out 13",
+        f"refused {work} 13",
+        "refused /tmp 13",
+        "read /etc/os-release",
+    ]
+
+
+def by_id(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """A batch's outputs keyed by item id."""
+    return {entry["id"]: entry["outputs"] for entry in result["batch"]}
+
+
+PROGRAM = """
+import os, sys, time
+case = sys.stdin.readline().strip()
+if case == "double":
+    print(int(sys.stdin.readline()) * 2)
+elif case == "spin":
+    while True:
+        pass
+elif case == "sleep":
+    time.sleep(60)
+elif case == "grow":
+    blocks = []
+    while True:
+        blocks.append(b"x" * (8 * 1024 * 1024))
+elif case == "flood":
+    line = "y" * 1023 + "\\n"
+    while True:
+        sys.stdout.write(line)
+elif case == "fail":
+    print("partial")
+    sys.exit(3)
+elif case == "escape":
+    work = sys.stdin.readline().strip()
+    for path in (work + "/escaped", work + "/inputs.json", "/tmp/escaped"):
+        try:
+            open(path, "w").close()
+            print("wrote", path)
+        except OSError as error:
+            print("refused", path, error.errno)
+    open("here", "w").write("fine")
+    print("cwd", sorted(os.listdir(".")))
+elif case == "peek":
+    for path in sys.stdin.read().split():
+        try:
+            if os.path.isdir(path):
+                os.listdir(path)
+            else:
+                open(path, "rb").close()
+            print("read", path)
+        except OSError as error:
+            print("refused", path, error.errno)
+elif case == "linger":
+    if os.fork() == 0:
+        os.setsid()
+        time.sleep(60)
+        os._exit(0)
+    print("left one behind")
+elif case == "census":
+    print(len([p for p in os.listdir("/proc") if p.isdigit()]))
+elif case == "parricide":
+    os.kill(os.getppid(), 9)
+    print("after")
+elif case == "hidden-work":
+    if os.fork() == 0:
+        while True:
+            pass
+    time.sleep(30)
+elif case == "hidden-memory":
+    child = os.fork()
+    if child == 0:
+        blocks = []
+        while True:
+            blocks.append(b"x" * (8 * 1024 * 1024))
+    os.waitpid(child, 0)
+elif case == "prying":
+    for path in ("/proc/%d/fd/3" % os.getppid(), "/proc/1/mem"):
+        try:
+            open(path, "rb").close()
+            print("opened", path)
+        except OSError as error:
+            print("refused", error.errno)
+elif case == "interrupt":
+    import signal
+    try:
+        os.kill(1, signal.SIGINT)
+    except OSError as error:
+        print("refused", error.errno)
+    print("still here")
+"""
