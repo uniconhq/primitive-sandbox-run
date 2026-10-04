@@ -1,6 +1,6 @@
 [project]
 name = "primitive-sandbox-run"
-version = "1.0.0"
+version = "1.1.0"
 description = "The Unicon sandbox-run primitive: run a binary once per test and measure each run."
 readme = "README.md"
 license = "MIT"
@@ -29,7 +29,7 @@ package = false
 
 [tool.ruff]
 line-length = 88
-src = ["src", "tests", "scripts"]
+src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "PTH", "RUF"]
@@ -40,12 +40,12 @@ select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "PTH", "RUF"]
 python_version = "3.14"
 platform = "linux"
 strict = true
-files = ["src", "tests", "scripts"]
-mypy_path = ["src", "scripts", "tests"]
+files = ["src", "tests"]
+mypy_path = ["src", "tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src", "scripts", "tests"]
+pythonpath = ["src", "tests"]
 addopts = "-q"
 markers = [
     "image: builds the image and runs it on Docker under the harness's sandbox flags",

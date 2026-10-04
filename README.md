@@ -11,7 +11,7 @@ from the `Dockerfile`; the program the image runs, `src/sandbox_run.py`; the
 small C program every binary is started through, `src/sandbox-exec.c`; and
 `primitive.yaml`, the declaration the forge compiler reads to type-check a
 workflow that uses the primitive. The program speaks the primitive contract,
-`primitive.schema.json` version 3, published by the
+`primitive.schema.json` version 4, published by the
 [runner](https://github.com/uniconhq/runner).
 
 ## What it takes and returns
@@ -161,8 +161,8 @@ each test's own limits so the container never dies before the program's own
 limit does: time and CPU to `2 × time_limit + 3` seconds (the wall-clock
 limit plus room to start and clean up), and memory to `memory_limit + 256` MB
 (room for the program itself and for the moment between two memory
-readings). The harness multiplies time and CPU by the number of tests in the
-batch.
+readings). The `forge` repo's compiler adds up time and CPU over the tests
+of the batch when it writes the plan.
 
 ## The binary format
 
@@ -186,10 +186,9 @@ Python or Java, is made in both repos together.
 
 ```
 Dockerfile                  the image: python:3.14-slim, OpenJDK 21 runtime, sandbox-exec
-src/sandbox_run.py          the program, installed as /usr/local/bin/sandbox-run
+src/sandbox_run.py          the program, installed as /usr/local/bin/sandbox-run, the image's entrypoint
 src/sandbox-exec.c          the launcher, built static and installed as /usr/local/bin/sandbox-exec
 primitive.yaml              the declaration, without the image line
-scripts/check_declaration.py  checks primitive.yaml against the runner's schema
 tests/                      unit tests, and image tests that run it on Docker
 ```
 
@@ -206,17 +205,20 @@ uv sync --locked
 uv run ruff format --check .
 uv run ruff check .
 uv run mypy
-uv run python scripts/check_declaration.py path/to/primitive.schema.json
+uv run python ../runner/scripts/check_declaration.py ../runner/schemas/primitive.schema.json .
 uv run pytest
 ```
+
+The declaration check is the runner's, so it runs from a `runner` checkout
+beside this one, at the release named in `.github/workflows/ci.yaml`.
 
 `uv run pytest` runs everything: the unit tests, which need Linux and gcc
 (they build `sandbox-exec` and run Python binaries on the interpreter running
 the tests), and the image tests (marked `image`), which build the image and
 run it under the harness's sandbox flags and the container limits the
-declaration gives. Elsewhere only the image and declaration tests are
-collected. Without Docker the image tests are skipped. They use
-`PRIMITIVE_IMAGE` instead of building when it is set. They run the image on
+declaration gives. Elsewhere only the image tests are collected. Without
+Docker the image tests are skipped. They use `PRIMITIVE_IMAGE` instead of
+building when it is set. They run the image on
 a Docker volume holding the working directory, as the harness gives a step
 one: Landlock's rules do not hold on a directory Docker Desktop shares from
 Windows or macOS, whose files it cannot tell apart from one open to the next.
@@ -229,13 +231,19 @@ are skipped. CI builds it from `primitive-compile`'s `main`. The checks on
 every `inputs.json` and `outputs.json` the tests see read the schema from
 `PRIMITIVE_SCHEMA`, or from a `runner` checkout beside this one.
 
-CI runs the checks and unit tests in one job, against `primitive.schema.json`
-from the runner release named in the workflow, and builds the image and runs
-the image tests in another.
+`.github/workflows/ci.yaml` and `release.yaml` call the workflows every
+primitive shares, `primitive-ci.yaml` and `primitive-release.yaml` in the
+[runner](https://github.com/uniconhq/runner) repo, at the runner release this
+primitive is built against, and name the same release as `runner-ref`. They
+check this repo out beside the runner at that release, so the checks read
+its `primitive.schema.json` and run its `scripts/check_declaration.py`. CI
+runs the checks and unit tests in one job, and builds the image and runs the
+image tests in another. Moving to a new runner release is a change to the
+two `uses:` lines and `runner-ref` together.
 
 ## Releasing
 
-Push a tag `v1.2.3` on `main`. The release workflow refuses a tag whose
+Push a tag `v1.2.3` on `main`. The shared release workflow refuses a tag whose
 commit is not on `main`, a tag that differs from the version in
 `pyproject.toml`, and a tag that is not a release of the version
 `primitive.yaml` declares (`v1.2.3` is a release of `v1`). It runs the same

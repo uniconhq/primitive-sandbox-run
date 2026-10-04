@@ -43,7 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 OUTPUT_LIMIT = 32 * 1024 * 1024
 POLL_SECONDS = 0.005
 STRAY_SECONDS = 5.0

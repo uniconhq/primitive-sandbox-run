@@ -1,6 +1,5 @@
 name: unicon/sandbox-run
 version: v1
-entrypoint: [/usr/local/bin/sandbox-run]
 batch: true
 limits: {time_ms: 5000, cpu_ms: 5000, memory_mb: 256, pids: 128, output_mb: 64}
 limits_from:

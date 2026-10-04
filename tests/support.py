@@ -104,7 +104,7 @@ def batch_inputs(
                 },
             }
         )
-    document = {"schema_version": 3, "step": "run", "batch": batch}
+    document = {"schema_version": 4, "batch": batch}
     (work / "inputs.json").write_text(json.dumps(document))
 
 
