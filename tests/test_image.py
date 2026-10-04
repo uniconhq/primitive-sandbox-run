@@ -217,6 +217,33 @@ def test_a_hostile_run_cannot_reach_the_program_that_watches_it(
     assert (work / "out" / "ok" / "output").read_text() == "42\n"
 
 
+def test_memory_is_the_whole_runs(tmp_path: Path, run_image: RunImage) -> None:
+    """In the sandbox, two processes holding 40 MB each are over a 64 MB limit
+    together, also when both make themselves not dumpable so their pages
+    cannot be read, and a child forked from a binary holding 40 MB is not
+    charged again for the pages it shares with it.
+    """
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    items = [
+        ("split", "split-memory\n"),
+        ("undumpable", "undumpable-split-memory\n"),
+        ("alone", "hold-memory\n"),
+        ("shared", "shared-memory\n"),
+    ]
+    outputs = run_batch(run_image, work, binary, items, time_limit=3)
+    assert outcomes(outputs) == {
+        "split": "memory_limit",
+        "undumpable": "memory_limit",
+        "alone": "accepted",
+        "shared": "accepted",
+    }
+    alone = outputs["alone"]["memory_kb"]
+    shared = outputs["shared"]["memory_kb"]
+    assert isinstance(alone, int) and isinstance(shared, int)
+    assert shared < alone + 4 * 1024
+
+
 def test_native_binaries_from_compile(
     tmp_path: Path, run_image: RunImage, compiled: Compiled, check: Check
 ) -> None:

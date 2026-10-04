@@ -207,6 +207,24 @@ elif case == "hidden-memory":
         while True:
             blocks.append(b"x" * (8 * 1024 * 1024))
     os.waitpid(child, 0)
+elif case in ("split-memory", "undumpable-split-memory"):
+    if case.startswith("undumpable"):
+        import ctypes
+        ctypes.CDLL(None).prctl(4, 0, 0, 0, 0)
+    child = os.fork()
+    block = b"x" * (40 * 1024 * 1024)
+    time.sleep(0.5)
+    if child == 0:
+        os._exit(0)
+    os.waitpid(child, 0)
+    print("held", 2 * len(block) // 1024 // 1024)
+elif case in ("hold-memory", "shared-memory"):
+    block = b"x" * (40 * 1024 * 1024)
+    if case == "shared-memory" and os.fork() == 0:
+        time.sleep(0.5)
+        os._exit(0)
+    time.sleep(0.5)
+    print("held", len(block) // 1024 // 1024)
 elif case == "prying":
     for path in ("/proc/%d/fd/3" % os.getppid(), "/proc/1/mem"):
         try:
