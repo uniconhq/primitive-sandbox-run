@@ -271,10 +271,10 @@ def test_a_json_file_is_written_whole_past_a_planted_link(tmp_path: Path) -> Non
     target = tmp_path / "elsewhere"
     target.write_text("untouched")
     (tmp_path / "outputs.json.partial").symlink_to(target)
-    sandbox_run.write_json(tmp_path / "outputs.json", {"schema_version": 3})
+    sandbox_run.write_json(tmp_path / "outputs.json", {"schema_version": 4})
     assert target.read_text() == "untouched"
     assert not (tmp_path / "outputs.json").is_symlink()
-    assert json.loads((tmp_path / "outputs.json").read_text()) == {"schema_version": 3}
+    assert json.loads((tmp_path / "outputs.json").read_text()) == {"schema_version": 4}
 
 
 def test_a_run_reads_neither_another_runs_files_nor_the_steps(
