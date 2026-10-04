@@ -28,7 +28,7 @@ of the batch has these inputs and outputs.
 | Input | `memory_limit` | number | Megabytes of memory the run may use |
 | Output | `output` | file | `out/<test id>/output`, what the binary printed on standard output |
 | Output | `time_ms` | number | CPU time used, user plus system, in milliseconds |
-| Output | `memory_kb` | number | Peak resident memory of the binary's process, in kilobytes |
+| Output | `memory_kb` | number | Peak resident memory of the run, all its processes together (below), in kilobytes |
 | Output | `outcome` | outcome | `accepted`, `time_limit`, `memory_limit`, `output_limit` or `runtime_error` |
 
 A run that goes over a limit or crashes is an ordinary result for that test,
@@ -68,7 +68,7 @@ Everything a run prints is kept, up to the output limit, even when it failed.
 |---|---|
 | CPU time: `time_limit` seconds | Every process of the run, added up, read every 5 ms from `/proc` and the binary killed once over; `RLIMIT_CPU` at the limit rounded up plus a second as a backstop. The time reported is the binary's own with its waited-for children, from `wait4`, plus every process it left behind, which this program reaps, so work hidden in a child that is never waited for still counts |
 | Wall-clock time: twice `time_limit` plus one second | Checked every 5 ms. It stops a run that sleeps or waits without using the CPU; the margin keeps a busy machine from turning a fast run into a time limit |
-| Memory: `memory_limit` megabytes | The highest peak resident memory of any one process of the run, read every 5 ms from `/proc` and the binary killed once over, then checked again against the final peak. Forked processes share pages, so they are not added up; the container's own limit holds their total. Java also gets `-Xmx` at the limit |
+| Memory: `memory_limit` megabytes | The run's peak memory, read from `/proc` while it runs and the binary killed once over, then checked again against the binary's own final peak from `wait4`. It is the higher of two figures: the peak resident memory of any one process, which the kernel keeps, and the highest total of all the run's processes seen, with each page two or more of them share divided among them (`Pss` in `/proc/<pid>/smaps_rollup`), so a child forked from the binary is charged for the pages it changes and not again for those it shares with its parent. The kernel keeps no peak of the total: it is read at most every 5 ms, so processes that together go over for less than the time between two readings are not caught, and the container's own limit holds them. Reading it walks every page the run holds, about 25 µs a megabyte, so it is read only when the processes together hold more than the peak so far, never for a run of one process, and for at most a fifth of the time. Java also gets `-Xmx` at the limit |
 | Output: 32 MB | Checked every 5 ms, and `RLIMIT_FSIZE` just above it, so no write can go further; an output that went over is cut to 32 MB |
 | Stack | `RLIMIT_STACK` set to the memory limit, so deep recursion is bounded by memory rather than the default 8 MB |
 
