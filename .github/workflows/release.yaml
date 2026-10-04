@@ -4,171 +4,19 @@ on:
   push:
     tags: ["v*"]
 
-# Nothing by default: each job asks for what it needs. The job that runs the
-# repo's code and tests can only read; the one that pushes the image only
-# loads and pushes what the first one tested; the one that writes the release
-# only uploads files.
 permissions: {}
 
-env:
-  RUNNER_RELEASE: v0.3.0
-  SCHEMA_URL: https://github.com/uniconhq/runner/releases/download
-  IMAGE: ghcr.io/uniconhq/primitive-sandbox-run
-
+# The release every primitive shares lives in the runner repo, at the release
+# whose primitive contract this primitive is built against. It checks the
+# tag, runs the same checks as CI, pushes the tested image and writes the
+# GitHub release; each of its jobs takes only the part of these permissions
+# it needs.
 jobs:
-  check:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # The ancestry check below needs main's history, not the tag alone:
-          # with the whole history the checkout fetches every branch.
-          fetch-depth: 0
-          persist-credentials: false
-
-      # A release is what deploy pins, so it comes from the reviewed branch.
-      - name: Check the tag is on main
-        run: |
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "$GITHUB_REF_NAME is not on main; release only from main"
-            exit 1
-          fi
-
-      # The tag must be the package version, and must belong to the version
-      # primitive.yaml declares: v1.2.3 is a release of v1.
-      - name: Check the tag matches the declared versions
-        run: |
-          tagged="${GITHUB_REF_NAME#v}"
-          declared="$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)"
-          if [ "$tagged" != "$declared" ]; then
-            echo "tag $GITHUB_REF_NAME does not match pyproject version $declared"
-            exit 1
-          fi
-          interface="$(grep -m1 '^version: ' primitive.yaml | cut -d' ' -f2)"
-          case "$GITHUB_REF_NAME" in
-            "$interface".*) ;;
-            *) echo "tag $GITHUB_REF_NAME is not a release of $interface"; exit 1 ;;
-          esac
-
-      # The same checks as CI: a tag on a red commit must not become a release.
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
-        with:
-          version: "0.12.13"
-      - run: uv sync --locked
-      - run: uv run ruff format --check .
-      - run: uv run ruff check .
-      - run: uv run mypy
-      - name: Fetch the primitive contract
-        run: >-
-          curl --fail --silent --show-error --location
-          --output "$RUNNER_TEMP/primitive.schema.json"
-          "$SCHEMA_URL/$RUNNER_RELEASE/primitive.schema.json"
-      - run: uv run python scripts/check_declaration.py "$RUNNER_TEMP/primitive.schema.json"
-      - run: uv run pytest -m "not image"
-        env:
-          PRIMITIVE_SCHEMA: ${{ runner.temp }}/primitive.schema.json
-
-      # Built once; the image tests run this image and the next job pushes it.
-      - run: docker build -t primitive-sandbox-run:release .
-
-      # Native and Java test binaries come from the compile primitive itself,
-      # so these tests are also the check that the two agree on the binary
-      # format. Its main branch is the version that will ship next to this one.
-      # It is built and run here, in the job that can only read.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: uniconhq/primitive-compile
-          ref: main
-          path: primitive-compile
-          persist-credentials: false
-      - run: docker build -t primitive-compile:release primitive-compile
-      - run: uv run pytest -m image
-        env:
-          PRIMITIVE_IMAGE: primitive-sandbox-run:release
-          COMPILE_IMAGE: primitive-compile:release
-          PRIMITIVE_SCHEMA: ${{ runner.temp }}/primitive.schema.json
-
-      # Exactly the tested image, handed to the job that pushes it.
-      - run: docker save -o image.tar primitive-sandbox-run:release
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: image
-          path: image.tar
-          retention-days: 1
-          if-no-files-found: error
-
-  publish:
-    needs: check
-    runs-on: ubuntu-latest
-    permissions:
-      packages: write
-    outputs:
-      digest: ${{ steps.push.outputs.digest }}
-    steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: image
-
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Tagged with the release and never :latest. A plan names the image by
-      # digest, so a moving tag would only invite pulling something no plan
-      # was compiled for.
-      - id: push
-        name: Push the tested image and read its digest
-        run: |
-          docker load -i image.tar
-          target="$IMAGE:$GITHUB_REF_NAME"
-          docker tag primitive-sandbox-run:release "$target"
-          docker push "$target"
-          digests="$(docker image inspect "$target" --format '{{json .RepoDigests}}')"
-          digest="$(echo "$digests" | grep -o "$IMAGE@sha256:[0-9a-f]*" | head -n1 | cut -d@ -f2)"
-          case "$digest" in
-            sha256:*) ;;
-            *) echo "no digest for $target"; exit 1 ;;
-          esac
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
-
   release:
-    needs: publish
-    runs-on: ubuntu-latest
+    uses: uniconhq/runner/.github/workflows/primitive-release.yaml@v0.4.0
     permissions:
       contents: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      # The same shape as the runner's images.json, so deploy reads every
-      # release manifest the same way.
-      - name: Write images.json
-        env:
-          DIGEST: ${{ needs.publish.outputs.digest }}
-        run: |
-          cat > images.json <<EOF
-          {
-            "release": "$GITHUB_REF_NAME",
-            "images": {
-              "primitive-sandbox-run": "$IMAGE@$DIGEST"
-            }
-          }
-          EOF
-          cat images.json
-
-      # The digest is what bootstrap writes into the forge's primitive.yaml as
-      # the image line, and what deploy/images.json pins.
-      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
-        with:
-          body: |
-            | Image | Digest |
-            |---|---|
-            | `${{ env.IMAGE }}:${{ github.ref_name }}` | `${{ needs.publish.outputs.digest }}` |
-          files: |
-            images.json
-            primitive.yaml
+      packages: write
+    with:
+      runner-ref: v0.4.0
+      compile-image: true
