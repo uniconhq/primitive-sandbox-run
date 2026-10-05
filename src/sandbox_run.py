@@ -39,7 +39,7 @@ import tempfile
 import time
 import zipfile
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO
 
@@ -59,6 +59,13 @@ STRAY_SECONDS = 1.0
 killed."""
 REAP_SECONDS = 5.0
 OOM_EVENTS = Path("/sys/fs/cgroup/memory.events")
+CGROUPS = Path("/sys/fs/cgroup")
+HELD = frozenset({"anon", "shmem"})
+"""What of the container's memory a run can hold on purpose, by its name in
+`memory.stat`: anonymous memory, and shared memory, which is every file kept
+in a tmpfs and every memory file (`memfd_create`), open or deleted. Pages
+read from or written to a file on disk are left out: the kernel takes them
+back when it needs them."""
 JAVA_OUT_OF_MEMORY = 3
 RUN_PATH = "/usr/local/bin:/usr/bin:/bin"
 HELPER = "/usr/local/bin/sandbox-exec"
@@ -209,17 +216,22 @@ class Run:
 class RunMemory:
     """The memory of one run's processes, read while the run goes on.
 
-    `peak_kb` is the highest of two readings, in kilobytes. One is the peak
+    `peak_kb` is the highest of three readings, in kilobytes. One is the peak
     resident memory of each process alone, which the kernel keeps itself
     (`VmHWM`), so no process's own peak between two readings is missed. The
-    other is the resident memory of all the run's processes added up, with
+    second is the resident memory of all the run's processes added up, with
     each page several of them share divided among them (`Pss`): a child
     forked from the binary shares its parent's pages until it changes them,
     so it is charged only for the pages it changes, while two processes that
-    each fill memory of their own are charged for both. The kernel keeps no
-    peak of that total, so processes that together go over for less than the
-    time between two readings are not seen; the container's own memory limit
-    holds them.
+    each fill memory of their own are charged for both. The third is what the
+    cgroup whose `memory.stat` is `stat`, the container's, holds beyond what
+    it held when the reading began, before the run started (`HELD`): that
+    counts what no process's pages do, the files a run keeps in its own
+    directory, which is in a tmpfs, files it deleted and keeps open, and
+    memory files, and only one run goes at a time. The kernel keeps no peak
+    of the second and the third, so memory held for less than the time
+    between two readings is not seen; the container's own memory limit holds
+    it.
 
     Reading the total walks every page the run holds, so it is read only
     when it could raise the peak, that is when the processes' resident memory
@@ -228,11 +240,20 @@ class RunMemory:
     long as the last reading took has passed.
     """
 
+    stat: Path | None = None
     peak_kb: int = 0
     total_due: float = 0.0
+    held_before: int | None = field(init=False, default=None)
+
+    def __post_init__(self) -> None:
+        if self.stat is not None:
+            self.held_before = held_kb(self.stat)
 
     def read(self, processes: set[int]) -> None:
         """Read the memory of the run's processes and raise the peak."""
+        held = held_kb(self.stat) if self.stat is not None else None
+        if held is not None and self.held_before is not None:
+            self.peak_kb = max(self.peak_kb, held - self.held_before)
         resident: dict[int, int] = {}
         for pid in processes:
             highest, resident[pid] = resident_memory(pid)
@@ -478,6 +499,7 @@ def execute(
         ) from None
     read_end, write_end = os.pipe()
     passed = (write_end, ruleset)
+    memory = RunMemory(stat=memory_stat())
     started = time.monotonic()
     try:
         helper = subprocess.Popen(
@@ -502,7 +524,6 @@ def execute(
     pid = 0
     stopped: str | None = None
     stopped_at = 0.0
-    memory = RunMemory()
     killed_before = oom_kills()
     cpu = 0.0
     me = os.getpid()
@@ -642,8 +663,8 @@ def judge(run: Run, item: Item, kind: str) -> str:
     what was measured and how the run ended, and any other failure is a
     runtime error. A jar that ran out of Java heap exits with code 3, and a
     run the kernel killed for the container's memory is over the memory
-    limit too: memory a run keeps where no process's share counts it, in
-    files under its own `/tmp`, is still charged to the container.
+    limit too, having held more between two readings than the container
+    allows.
     """
     if run.stopped:
         return {"time": "time_limit", "memory": "memory_limit"}.get(
@@ -742,6 +763,38 @@ def proportional_memory(pid: int, resident_kb: int) -> int:
         if line.startswith("Pss:"):
             return int(line.split()[1])
     return 0
+
+
+def memory_stat() -> Path:
+    """The `memory.stat` of this program's own cgroup, which holds the runs
+    too: the container's, in a step, where the container sees its own cgroup
+    as the root.
+    """
+    try:
+        lines = Path("/proc/self/cgroup").read_text().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        if line.startswith("0::"):
+            return CGROUPS / line[3:].strip().lstrip("/") / "memory.stat"
+    return CGROUPS / "memory.stat"
+
+
+def held_kb(stat: Path) -> int | None:
+    """The memory a cgroup holds that a run can hold on purpose (`HELD`), in
+    kilobytes, from its `memory.stat`, readable even where the cgroup is not
+    writable; none where there is no such file.
+    """
+    try:
+        text = stat.read_text()
+    except OSError:
+        return None
+    held = 0
+    for line in text.splitlines():
+        name, _, count = line.partition(" ")
+        if name in HELD:
+            held += int(count)
+    return held // 1024
 
 
 def oom_kills() -> int:

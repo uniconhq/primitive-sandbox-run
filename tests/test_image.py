@@ -252,6 +252,35 @@ def test_memory_is_the_whole_runs(tmp_path: Path, run_image: RunImage) -> None:
     assert shared < alone + 4 * 1024
 
 
+def test_memory_kept_in_files_counts(tmp_path: Path, run_image: RunImage) -> None:
+    """In the sandbox, memory a run keeps in files is memory: 24 MB held and
+    48 MB written to a file in its own directory, to one it deleted and keeps
+    open, or to a memory file with no path at all, is over a 64 MB limit,
+    while 40 MB held beside a small file is not.
+    """
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    items = [
+        ("file", "file-memory\n"),
+        ("unlinked", "unlinked-memory\n"),
+        ("memfd", "memfd-memory\n"),
+        ("small", "small-file\n"),
+        ("alone", "hold-memory\n"),
+    ]
+    outputs = run_batch(run_image, work, binary, items, time_limit=3)
+    assert outcomes(outputs) == {
+        "file": "memory_limit",
+        "unlinked": "memory_limit",
+        "memfd": "memory_limit",
+        "small": "accepted",
+        "alone": "accepted",
+    }
+    small = outputs["small"]["memory_kb"]
+    alone = outputs["alone"]["memory_kb"]
+    assert isinstance(small, int) and isinstance(alone, int)
+    assert alone <= small < alone + 4 * 1024
+
+
 def test_native_binaries_from_compile(
     tmp_path: Path, run_image: RunImage, compiled: Compiled, check: Check
 ) -> None:

@@ -236,6 +236,26 @@ elif case in ("hold-memory", "shared-memory"):
         os._exit(0)
     time.sleep(0.5)
     print("held", len(block) // 1024 // 1024)
+elif case in ("file-memory", "unlinked-memory", "memfd-memory"):
+    block = b"x" * (24 * 1024 * 1024)
+    chunk = b"y" * (1024 * 1024)
+    for name in ("one", "two"):
+        if case == "memfd-memory":
+            kept = os.memfd_create(name)
+        else:
+            kept = os.open(name, os.O_RDWR | os.O_CREAT)
+            if case == "unlinked-memory":
+                os.unlink(name)
+        for _ in range(24):
+            os.write(kept, chunk)
+    time.sleep(0.5)
+    print("held", (len(block) + 48 * len(chunk)) // 1024 // 1024)
+elif case == "small-file":
+    block = b"x" * (40 * 1024 * 1024)
+    with open("note", "wb") as note:
+        note.write(b"z" * (1024 * 1024))
+    time.sleep(0.5)
+    print("held", len(block) // 1024 // 1024)
 elif case == "prying":
     for path in ("/proc/%d/fd/3" % os.getppid(), "/proc/1/mem"):
         try:
