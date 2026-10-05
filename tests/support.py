@@ -144,7 +144,7 @@ def by_id(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 PROGRAM = """
-import os, sys, time
+import os, signal, sys, time
 case = sys.stdin.readline().strip()
 if case == "double":
     print(int(sys.stdin.readline()) * 2)
@@ -199,6 +199,13 @@ elif case == "parricide":
         print("refused", error.errno, flush=True)
         os._exit(1)
     print("after")
+elif case == "freeze":
+    try:
+        os.kill(os.getppid(), signal.SIGSTOP)
+    except OSError:
+        pass
+    while True:
+        pass
 elif case == "hidden-work":
     if os.fork() == 0:
         while True:

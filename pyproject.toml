@@ -1,6 +1,6 @@
 [project]
 name = "primitive-sandbox-run"
-version = "1.1.0"
+version = "1.2.0"
 description = "The Unicon sandbox-run primitive: run a binary once per test and measure each run."
 readme = "README.md"
 license = "MIT"

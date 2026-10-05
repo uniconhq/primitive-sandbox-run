@@ -10,6 +10,7 @@ import os
 import shutil
 import signal
 import subprocess
+import time
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -242,6 +243,33 @@ def test_a_run_that_kills_its_launcher_is_a_runtime_error(
     said = (tmp_path / "work" / "out" / "parricide" / "output").read_text().splitlines()
     if sandbox_run.landlock_abi() >= 6:
         assert said == [f"refused {errno.EPERM}"]
+
+
+def test_a_run_that_stops_its_launcher_is_still_ended_on_time(run: Any) -> None:
+    """A binary that sends SIGSTOP to `sandbox-exec`, where Landlock lets it,
+    and then spins is stopped at its time limit, and the whole item is over
+    within a second or so of that, not after a long wait for the helper.
+    """
+    started = time.monotonic()
+    result = run([("freeze", "freeze\n")], time_limit=0.5)
+    elapsed = time.monotonic() - started
+    assert by_id(result)["freeze"]["outcome"] == "time_limit"
+    assert elapsed < 4
+
+
+def test_a_run_the_kernel_killed_for_memory_is_over_the_memory_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = tmp_path / "memory.events"
+    events.write_text("low 0\nhigh 0\nmax 3\noom 1\noom_kill 2\n")
+    monkeypatch.setattr(sandbox_run, "OOM_EVENTS", events)
+    item = sandbox_run.Item(
+        "x", tmp_path / "binary", tmp_path / "input", time_limit=1.0, memory_limit=64
+    )
+    run = sandbox_run.Run(-9, 0.1, 0.2, 1000, 0, None, out_of_memory=True)
+
+    assert sandbox_run.oom_kills() == 2
+    assert sandbox_run.judge(run, item, "native") == "memory_limit"
 
 
 def test_work_in_a_child_counts_against_the_time_limit(run: Any) -> None:
