@@ -310,6 +310,48 @@ def test_a_forked_child_is_not_charged_again_for_what_it_shares(run: Any) -> Non
     assert outputs["shared"]["memory_kb"] < outputs["alone"]["memory_kb"] + 4 * 1024
 
 
+def test_what_the_cgroup_holds_beyond_the_start_of_a_run_counts(tmp_path: Path) -> None:
+    """Everything charged to the run's cgroup beyond what it held when the
+    reading began counts, but for pages of files on disk; files in a tmpfs,
+    which the cgroup counts as file pages too, count.
+    """
+    (tmp_path / "memory.current").write_text(str(910 * 2**20))
+    (tmp_path / "memory.stat").write_text(
+        f"anon {10 * 2**20}\nfile {900 * 2**20}\nshmem 0\n"
+    )
+    memory = sandbox_run.RunMemory(cgroup=tmp_path)
+    (tmp_path / "memory.current").write_text(str(84 * 2**20))
+    (tmp_path / "memory.stat").write_text(
+        f"anon {20 * 2**20}\nfile {60 * 2**20}\nshmem {50 * 2**20}\nsock {4 * 2**20}\n"
+    )
+
+    memory.read(set())
+
+    assert memory.peak_kb == (84 - 10 - 10) * 1024
+
+
+def test_a_cgroup_with_no_memory_accounting_adds_no_reading(tmp_path: Path) -> None:
+    memory = sandbox_run.RunMemory(cgroup=tmp_path / "absent")
+
+    memory.read(set())
+
+    assert (memory.held_before, memory.peak_kb) == (None, 0)
+
+
+def test_a_run_outside_a_cgroup_of_its_own_is_warned_about(
+    run: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A test machine's cgroup holds other processes too, so its memory is
+    not read, and the program says so.
+    """
+    assert sandbox_run.own_cgroup() is None
+
+    outputs = by_id(run([("ok", "double\n21\n")]))
+
+    assert outputs["ok"]["outcome"] == "accepted"
+    assert sandbox_run.NO_CGROUP in capsys.readouterr().err
+
+
 def test_the_total_is_read_only_when_it_could_raise_the_peak(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
