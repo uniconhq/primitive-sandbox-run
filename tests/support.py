@@ -250,6 +250,33 @@ elif case in ("file-memory", "unlinked-memory", "memfd-memory"):
             os.write(kept, chunk)
     time.sleep(0.5)
     print("held", (len(block) + 48 * len(chunk)) // 1024 // 1024)
+elif case == "pipe-memory":
+    import fcntl
+    block = b"x" * (24 * 1024 * 1024)
+    pipes = []
+    for _ in range(48):
+        read_end, write_end = os.pipe()
+        fcntl.fcntl(write_end, fcntl.F_SETPIPE_SZ, 1024 * 1024)
+        os.set_blocking(write_end, False)
+        os.write(write_end, b"y" * (1024 * 1024))
+        pipes.append((read_end, write_end))
+    time.sleep(0.5)
+    print("held", (len(block) + 48 * 1024 * 1024) // 1024 // 1024)
+elif case == "socket-memory":
+    import socket
+    block = b"x" * (24 * 1024 * 1024)
+    pairs, sent = [], 0
+    while sent < 48 * 1024 * 1024 and len(pairs) < 400:
+        one, two = socket.socketpair()
+        one.setblocking(False)
+        try:
+            while True:
+                sent += one.send(b"y" * 65536)
+        except BlockingIOError:
+            pass
+        pairs.append((one, two))
+    time.sleep(0.5)
+    print("held", (len(block) + sent) // 1024 // 1024)
 elif case == "small-file":
     block = b"x" * (40 * 1024 * 1024)
     with open("note", "wb") as note:

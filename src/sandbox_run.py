@@ -59,13 +59,12 @@ STRAY_SECONDS = 1.0
 killed."""
 REAP_SECONDS = 5.0
 OOM_EVENTS = Path("/sys/fs/cgroup/memory.events")
-CGROUPS = Path("/sys/fs/cgroup")
-HELD = frozenset({"anon", "shmem"})
-"""What of the container's memory a run can hold on purpose, by its name in
-`memory.stat`: anonymous memory, and shared memory, which is every file kept
-in a tmpfs and every memory file (`memfd_create`), open or deleted. Pages
-read from or written to a file on disk are left out: the kernel takes them
-back when it needs them."""
+CGROUP = Path("/sys/fs/cgroup")
+NO_CGROUP = (
+    "sandbox-run: this program is not alone in a cgroup of its own with cgroup v2 "
+    "memory accounting, so memory a run keeps outside its processes, in files, "
+    "pipes or sockets, is not counted against its limit"
+)
 JAVA_OUT_OF_MEMORY = 3
 RUN_PATH = "/usr/local/bin:/usr/bin:/bin"
 HELPER = "/usr/local/bin/sandbox-exec"
@@ -223,12 +222,12 @@ class RunMemory:
     each page several of them share divided among them (`Pss`): a child
     forked from the binary shares its parent's pages until it changes them,
     so it is charged only for the pages it changes, while two processes that
-    each fill memory of their own are charged for both. The third is what the
-    cgroup whose `memory.stat` is `stat`, the container's, holds beyond what
-    it held when the reading began, before the run started (`HELD`): that
-    counts what no process's pages do, the files a run keeps in its own
-    directory, which is in a tmpfs, files it deleted and keeps open, and
-    memory files, and only one run goes at a time. The kernel keeps no peak
+    each fill memory of their own are charged for both. The third is what
+    `cgroup`, the step container's, holds beyond what it held when the
+    reading began, before the run started (`held_kb`): that counts what no
+    process's pages do, the files a run keeps in its own directory, which is
+    in a tmpfs, files it deleted and keeps open, memory files, and pipe and
+    socket buffers, and only one run goes at a time. The kernel keeps no peak
     of the second and the third, so memory held for less than the time
     between two readings is not seen; the container's own memory limit holds
     it.
@@ -240,18 +239,18 @@ class RunMemory:
     long as the last reading took has passed.
     """
 
-    stat: Path | None = None
+    cgroup: Path | None = None
     peak_kb: int = 0
     total_due: float = 0.0
     held_before: int | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
-        if self.stat is not None:
-            self.held_before = held_kb(self.stat)
+        if self.cgroup is not None:
+            self.held_before = held_kb(self.cgroup)
 
     def read(self, processes: set[int]) -> None:
         """Read the memory of the run's processes and raise the peak."""
-        held = held_kb(self.stat) if self.stat is not None else None
+        held = held_kb(self.cgroup) if self.cgroup is not None else None
         if held is not None and self.held_before is not None:
             self.peak_kb = max(self.peak_kb, held - self.held_before)
         resident: dict[int, int] = {}
@@ -367,6 +366,8 @@ def run_batch(root: Path, items: list[Item]) -> list[dict[str, object]]:
     """
     prctl(PR_SET_CHILD_SUBREAPER, 1)
     prctl(PR_SET_DUMPABLE, 0)
+    if own_cgroup() is None:
+        print(NO_CGROUP, file=sys.stderr)
     previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
         return run_all(root, items)
@@ -499,7 +500,7 @@ def execute(
         ) from None
     read_end, write_end = os.pipe()
     passed = (write_end, ruleset)
-    memory = RunMemory(stat=memory_stat())
+    memory = RunMemory(cgroup=own_cgroup())
     started = time.monotonic()
     try:
         helper = subprocess.Popen(
@@ -663,8 +664,8 @@ def judge(run: Run, item: Item, kind: str) -> str:
     what was measured and how the run ended, and any other failure is a
     runtime error. A jar that ran out of Java heap exits with code 3, and a
     run the kernel killed for the container's memory is over the memory
-    limit too, having held more between two readings than the container
-    allows.
+    limit too: it held more than the container allows, between two readings
+    or where this program could not count it.
     """
     if run.stopped:
         return {"time": "time_limit", "memory": "memory_limit"}.get(
@@ -765,36 +766,43 @@ def proportional_memory(pid: int, resident_kb: int) -> int:
     return 0
 
 
-def memory_stat() -> Path:
-    """The `memory.stat` of this program's own cgroup, which holds the runs
-    too: the container's, in a step, where the container sees its own cgroup
-    as the root.
+def own_cgroup() -> Path | None:
+    """The cgroup that holds this program and its runs and nothing else: the
+    step container's, which sees its own cgroup as the root of its cgroup
+    namespace (the socket filter refuses a step any other), with cgroup v2's
+    memory accounting. None anywhere else, such as a test run on a machine,
+    whose cgroup holds other processes too.
     """
     try:
         lines = Path("/proc/self/cgroup").read_text().splitlines()
     except OSError:
-        lines = []
-    for line in lines:
-        if line.startswith("0::"):
-            return CGROUPS / line[3:].strip().lstrip("/") / "memory.stat"
-    return CGROUPS / "memory.stat"
+        return None
+    if "0::/" not in lines or not (CGROUP / "memory.current").is_file():
+        return None
+    return CGROUP
 
 
-def held_kb(stat: Path) -> int | None:
-    """The memory a cgroup holds that a run can hold on purpose (`HELD`), in
-    kilobytes, from its `memory.stat`, readable even where the cgroup is not
-    writable; none where there is no such file.
+def held_kb(cgroup: Path) -> int | None:
+    """What the cgroup holds that a run can hold on purpose, in kilobytes:
+    everything charged to it (`memory.current`) but the pages of files on
+    disk, which the kernel takes back when it needs them (`file` in
+    `memory.stat`, less `shmem`, which it counts there too and cannot take
+    back). That is anonymous memory, files in a tmpfs, memory files, pipe and
+    socket buffers, and the kernel's own memory for the processes. Both
+    files are readable even where the cgroup is not writable; none where
+    they are missing.
     """
     try:
-        text = stat.read_text()
-    except OSError:
+        current = int((cgroup / "memory.current").read_text())
+        stat = (cgroup / "memory.stat").read_text()
+    except OSError, ValueError:
         return None
-    held = 0
-    for line in text.splitlines():
-        name, _, count = line.partition(" ")
-        if name in HELD:
-            held += int(count)
-    return held // 1024
+    counts = dict(line.partition(" ")[::2] for line in stat.splitlines())
+    try:
+        reclaimable = int(counts.get("file", "0")) - int(counts.get("shmem", "0"))
+    except ValueError:
+        return None
+    return (current - reclaimable) // 1024
 
 
 def oom_kills() -> int:

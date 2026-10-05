@@ -253,10 +253,11 @@ def test_memory_is_the_whole_runs(tmp_path: Path, run_image: RunImage) -> None:
 
 
 def test_memory_kept_in_files_counts(tmp_path: Path, run_image: RunImage) -> None:
-    """In the sandbox, memory a run keeps in files is memory: 24 MB held and
-    48 MB written to a file in its own directory, to one it deleted and keeps
-    open, or to a memory file with no path at all, is over a 64 MB limit,
-    while 40 MB held beside a small file is not.
+    """In the sandbox, memory a run keeps outside its processes is memory:
+    24 MB held and 48 MB more written to files in its own directory, to files
+    it deleted and keeps open, to memory files with no path at all, or left
+    in pipes or sockets, is over a 64 MB limit, while 40 MB held beside a
+    small file is not.
     """
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
     work = tmp_path / "work"
@@ -264,6 +265,8 @@ def test_memory_kept_in_files_counts(tmp_path: Path, run_image: RunImage) -> Non
         ("file", "file-memory\n"),
         ("unlinked", "unlinked-memory\n"),
         ("memfd", "memfd-memory\n"),
+        ("pipe", "pipe-memory\n"),
+        ("socket", "socket-memory\n"),
         ("small", "small-file\n"),
         ("alone", "hold-memory\n"),
     ]
@@ -272,6 +275,8 @@ def test_memory_kept_in_files_counts(tmp_path: Path, run_image: RunImage) -> Non
         "file": "memory_limit",
         "unlinked": "memory_limit",
         "memfd": "memory_limit",
+        "pipe": "memory_limit",
+        "socket": "memory_limit",
         "small": "accepted",
         "alone": "accepted",
     }

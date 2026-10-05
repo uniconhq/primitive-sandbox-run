@@ -68,7 +68,7 @@ Everything a run prints is kept, up to the output limit, even when it failed.
 |---|---|
 | CPU time: `time_limit` seconds | Every process of the run, added up, read every 5 ms from `/proc` and the binary killed once over; `RLIMIT_CPU` at the limit rounded up plus a second as a backstop. The time reported is the binary's own with its waited-for children, from `wait4`, plus every process it left behind, which this program reaps, so work hidden in a child that is never waited for still counts |
 | Wall-clock time: twice `time_limit` plus one second | Checked every 5 ms. It stops a run that sleeps or waits without using the CPU; the margin keeps a busy machine from turning a fast run into a time limit |
-| Memory: `memory_limit` megabytes | The run's peak memory, read from `/proc` while it runs and the binary killed once over, then checked again against the binary's own final peak from `wait4`. It is the highest of three figures: the peak resident memory of any one process, which the kernel keeps; the highest total of all the run's processes seen, with each page two or more of them share divided among them (`Pss` in `/proc/<pid>/smaps_rollup`), so a child forked from the binary is charged for the pages it changes and not again for those it shares with its parent; and the most the container held beyond what it held before the run began, its anonymous and shared memory from `memory.stat`, which counts what no process's pages do: files the run keeps in its own directory, which is on the `/tmp` tmpfs, files it deleted and keeps open, and memory files (`memfd_create`). Only one run goes at a time, so what the container gains is the run's. The kernel keeps no peak of the last two: they are read at most every 5 ms, so memory held for less than the time between two readings is not caught, and the container's own limit holds it. Reading it walks every page the run holds, about 25 µs a megabyte, so it is read only when the processes together hold more than the peak so far, never for a run of one process, and for at most a fifth of the time. Java also gets `-Xmx` at the limit |
+| Memory: `memory_limit` megabytes | The run's peak memory, read from `/proc` while it runs and the binary killed once over, then checked again against the binary's own final peak from `wait4`. It is the highest of three figures: the peak resident memory of any one process, which the kernel keeps; the highest total of all the run's processes seen, with each page two or more of them share divided among them (`Pss` in `/proc/<pid>/smaps_rollup`), so a child forked from the binary is charged for the pages it changes and not again for those it shares with its parent; and the most the container held beyond what it held before the run began: everything charged to its cgroup (`memory.current`) but the pages of files on disk, which counts what no process's pages do, files the run keeps in its own directory, which is on the `/tmp` tmpfs, files it deleted and keeps open, memory files (`memfd_create`), and pipe and socket buffers. Only one run goes at a time, so what the container gains is the run's. That figure is read every 5 ms from the container's own cgroup, and on a machine where this program is not alone in a cgroup of its own it is not read and a warning goes to standard error. The total of the processes is read at most every 5 ms too: it walks every page the run holds, about 25 µs a megabyte, so it is read only when the processes together hold more than the peak so far, never for a run of one process, and for at most a fifth of the time. The kernel keeps no peak of the last two figures, so memory held for less than the time between two readings is not caught, and the container's own limit holds it. Java also gets `-Xmx` at the limit |
 | Output: 32 MB | Checked every 5 ms, and `RLIMIT_FSIZE` just above it, so no write can go further; an output that went over is cut to 32 MB |
 | Stack | `RLIMIT_STACK` set to the memory limit, so deep recursion is bounded by memory rather than the default 8 MB |
 
@@ -79,9 +79,10 @@ the binary was killed by `SIGXCPU`; `memory_limit` if the peak memory went
 over, a Java binary exited with code 3, which is how
 `-XX:+ExitOnOutOfMemoryError` ends a JVM that ran out of heap, or the kernel
 killed the binary for the container's memory, which the container's
-`memory.events` counts, having held more between two readings than the
-container allows; then `runtime_error` for any other non-zero exit or
-signal; otherwise `accepted`.
+`memory.events` counts, having held more than the container allows,
+between two readings or where this program could not count it; then
+`runtime_error` for any other non-zero exit or signal; otherwise
+`accepted`.
 
 A run stopped at a limit has its binary killed and `sandbox-exec` woken, in
 case the run stopped it with `SIGSTOP` where Landlock does not keep signals
@@ -90,7 +91,8 @@ in, so the item ends within a second of the limit.
 Memory is resident memory, the pages the binary actually touched, so an
 array that is declared but never used does not count against it. A file the
 run writes in its own directory counts too, since that directory is in
-memory.
+memory, and so does the kernel's own memory for the run's processes, such as
+their page tables, about a megabyte for a small program.
 
 **Why `sandbox-exec`.** Linux carries a process's peak resident memory across
 `exec`, so a binary started straight from the Python program would report at
