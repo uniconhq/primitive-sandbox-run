@@ -5,6 +5,7 @@ binaries come from the compile primitive's own image, so these tests are also
 the check that the two primitives agree on the binary format.
 """
 
+import errno
 import json
 import time
 from pathlib import Path
@@ -184,8 +185,10 @@ def test_a_run_reads_nothing_another_run_left(
 def test_a_hostile_run_cannot_reach_the_program_that_watches_it(
     tmp_path: Path, run_image: RunImage
 ) -> None:
-    """In the sandbox: killing the launcher is the run's own runtime error,
-    work and memory hidden in a child still count, the launcher's descriptors
+    """In the sandbox: signalling the launcher is refused from Landlock ABI 6
+    and killing it below that is the run's own runtime error, either way
+    without a traceback whose cost could reach the time limit on a busy
+    machine, work and memory hidden in a child still count, the launcher's descriptors
     and the program's memory cannot be opened, and SIGINT does not stop the
     program.
     """
@@ -208,6 +211,11 @@ def test_a_hostile_run_cannot_reach_the_program_that_watches_it(
         "interrupt": "accepted",
         "ok": "accepted",
     }
+    assert (work / "out" / "parricide" / "output").read_text().splitlines() in (
+        [f"refused {errno.EPERM}"],
+        ["after"],
+        [],
+    )
     assert (work / "out" / "prying" / "output").read_text().splitlines() == [
         "refused 13",
         "refused 13",

@@ -193,7 +193,11 @@ elif case == "linger":
 elif case == "census":
     print(len([p for p in os.listdir("/proc") if p.isdigit()]))
 elif case == "parricide":
-    os.kill(os.getppid(), 9)
+    try:
+        os.kill(os.getppid(), 9)
+    except OSError as error:
+        print("refused", error.errno, flush=True)
+        os._exit(1)
     print("after")
 elif case == "hidden-work":
     if os.fork() == 0:

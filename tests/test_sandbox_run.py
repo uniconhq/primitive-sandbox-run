@@ -227,14 +227,21 @@ def test_runs_write_only_their_own_directory(run: Any, tmp_path: Path) -> None:
     ]
 
 
-def test_a_run_that_kills_its_launcher_is_a_runtime_error(run: Any) -> None:
-    """Killing `sandbox-exec` leaves no report; the run is judged on what the
-    program measured itself, never an error of the step.
+def test_a_run_that_kills_its_launcher_is_a_runtime_error(
+    run: Any, tmp_path: Path
+) -> None:
+    """From Landlock ABI 6 the run may not signal `sandbox-exec` at all; below
+    it, killing `sandbox-exec` leaves no report and the run is judged on what
+    the program measured itself. Either way it is the run's own runtime
+    error, never an error of the step.
     """
     result = run([("parricide", "parricide\n"), ("ok", "double\n21\n")])
     outputs = by_id(result)
     assert outputs["parricide"]["outcome"] == "runtime_error"
     assert outputs["ok"]["outcome"] == "accepted"
+    said = (tmp_path / "work" / "out" / "parricide" / "output").read_text().splitlines()
+    if sandbox_run.landlock_abi() >= 6:
+        assert said == [f"refused {errno.EPERM}"]
 
 
 def test_work_in_a_child_counts_against_the_time_limit(run: Any) -> None:
