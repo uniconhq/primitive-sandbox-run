@@ -227,14 +227,21 @@ def test_runs_write_only_their_own_directory(run: Any, tmp_path: Path) -> None:
     ]
 
 
-def test_a_run_that_kills_its_launcher_is_a_runtime_error(run: Any) -> None:
-    """Killing `sandbox-exec` leaves no report; the run is judged on what the
-    program measured itself, never an error of the step.
+def test_a_run_that_kills_its_launcher_is_a_runtime_error(
+    run: Any, tmp_path: Path
+) -> None:
+    """From Landlock ABI 6 the run may not signal `sandbox-exec` at all; below
+    it, killing `sandbox-exec` leaves no report and the run is judged on what
+    the program measured itself. Either way it is the run's own runtime
+    error, never an error of the step.
     """
     result = run([("parricide", "parricide\n"), ("ok", "double\n21\n")])
     outputs = by_id(result)
     assert outputs["parricide"]["outcome"] == "runtime_error"
     assert outputs["ok"]["outcome"] == "accepted"
+    said = (tmp_path / "work" / "out" / "parricide" / "output").read_text().splitlines()
+    if sandbox_run.landlock_abi() >= 6:
+        assert said == [f"refused {errno.EPERM}"]
 
 
 def test_work_in_a_child_counts_against_the_time_limit(run: Any) -> None:
@@ -250,6 +257,60 @@ def test_memory_in_a_child_counts_against_the_memory_limit(run: Any) -> None:
     outputs = by_id(result)
     assert outputs["hidden-memory"]["outcome"] == "memory_limit"
     assert outputs["hidden-memory"]["memory_kb"] > 64 * 1024
+
+
+def test_memory_spread_over_processes_is_added_up(run: Any) -> None:
+    """Two processes that each hold 40 MB of their own at the same moment are
+    over a 64 MB limit together, though each alone is under it.
+    """
+    result = run([("split", "split-memory\n")], time_limit=3, memory_limit=64)
+    outputs = by_id(result)
+    assert outputs["split"]["outcome"] == "memory_limit"
+    assert outputs["split"]["memory_kb"] > 64 * 1024
+
+
+def test_a_forked_child_is_not_charged_again_for_what_it_shares(run: Any) -> None:
+    """A child forked from a binary holding 40 MB, which touches nothing of its
+    own, costs the run almost nothing: the pages it shares with its parent
+    count once, not once in each process.
+    """
+    items = [("alone", "hold-memory\n"), ("shared", "shared-memory\n")]
+    outputs = by_id(run(items, time_limit=3, memory_limit=64))
+    assert outputs["alone"]["outcome"] == "accepted"
+    assert outputs["shared"]["outcome"] == "accepted"
+    assert outputs["alone"]["memory_kb"] > 40 * 1024
+    assert outputs["shared"]["memory_kb"] < outputs["alone"]["memory_kb"] + 4 * 1024
+
+
+def test_the_total_is_read_only_when_it_could_raise_the_peak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reading the processes' total walks every page they hold, so it is
+    skipped while their resident memory added up is not above the peak, and
+    read again only after `TOTAL_SPACING` times its own cost has passed.
+    """
+    resident = {1: (30_000, 30_000)}
+    read: list[int] = []
+
+    def proportional(pid: int, resident_kb: int) -> int:
+        read.append(pid)
+        return resident_kb
+
+    monkeypatch.setattr(sandbox_run, "resident_memory", resident.__getitem__)
+    monkeypatch.setattr(sandbox_run, "proportional_memory", proportional)
+    memory = sandbox_run.RunMemory()
+    memory.read({1})
+    assert (memory.peak_kb, read) == (30_000, [])
+    resident[2] = (40_000, 40_000)
+    memory.read({1, 2})
+    assert (memory.peak_kb, sorted(read)) == (70_000, [1, 2])
+    memory.total_due = float("inf")
+    memory.read({1, 2})
+    assert len(read) == 2
+    memory.total_due = 0.0
+    resident.update({1: (30_000, 10_000), 2: (40_000, 10_000)})
+    memory.read({1, 2})
+    assert (memory.peak_kb, len(read)) == (70_000, 2)
 
 
 def test_a_native_binary_the_kernel_will_not_run_is_a_runtime_error(

@@ -5,6 +5,7 @@ binaries come from the compile primitive's own image, so these tests are also
 the check that the two primitives agree on the binary format.
 """
 
+import errno
 import json
 import time
 from pathlib import Path
@@ -184,8 +185,10 @@ def test_a_run_reads_nothing_another_run_left(
 def test_a_hostile_run_cannot_reach_the_program_that_watches_it(
     tmp_path: Path, run_image: RunImage
 ) -> None:
-    """In the sandbox: killing the launcher is the run's own runtime error,
-    work and memory hidden in a child still count, the launcher's descriptors
+    """In the sandbox: signalling the launcher is refused from Landlock ABI 6
+    and killing it below that is the run's own runtime error, either way
+    without a traceback whose cost could reach the time limit on a busy
+    machine, work and memory hidden in a child still count, the launcher's descriptors
     and the program's memory cannot be opened, and SIGINT does not stop the
     program.
     """
@@ -208,6 +211,11 @@ def test_a_hostile_run_cannot_reach_the_program_that_watches_it(
         "interrupt": "accepted",
         "ok": "accepted",
     }
+    assert (work / "out" / "parricide" / "output").read_text().splitlines() in (
+        [f"refused {errno.EPERM}"],
+        ["after"],
+        [],
+    )
     assert (work / "out" / "prying" / "output").read_text().splitlines() == [
         "refused 13",
         "refused 13",
@@ -215,6 +223,33 @@ def test_a_hostile_run_cannot_reach_the_program_that_watches_it(
     interrupted = (work / "out" / "interrupt" / "output").read_text().splitlines()
     assert interrupted[-1] == "still here"
     assert (work / "out" / "ok" / "output").read_text() == "42\n"
+
+
+def test_memory_is_the_whole_runs(tmp_path: Path, run_image: RunImage) -> None:
+    """In the sandbox, two processes holding 40 MB each are over a 64 MB limit
+    together, also when both make themselves not dumpable so their pages
+    cannot be read, and a child forked from a binary holding 40 MB is not
+    charged again for the pages it shares with it.
+    """
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    items = [
+        ("split", "split-memory\n"),
+        ("undumpable", "undumpable-split-memory\n"),
+        ("alone", "hold-memory\n"),
+        ("shared", "shared-memory\n"),
+    ]
+    outputs = run_batch(run_image, work, binary, items, time_limit=3)
+    assert outcomes(outputs) == {
+        "split": "memory_limit",
+        "undumpable": "memory_limit",
+        "alone": "accepted",
+        "shared": "accepted",
+    }
+    alone = outputs["alone"]["memory_kb"]
+    shared = outputs["shared"]["memory_kb"]
+    assert isinstance(alone, int) and isinstance(shared, int)
+    assert shared < alone + 4 * 1024
 
 
 def test_native_binaries_from_compile(
