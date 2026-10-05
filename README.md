@@ -76,9 +76,17 @@ The outcome is decided in this order: the limit the run was stopped for, if
 it was; `output_limit` if the output went over or the binary was killed by
 `SIGXFSZ`; `time_limit` if the CPU time or the wall-clock time went over or
 the binary was killed by `SIGXCPU`; `memory_limit` if the peak memory went
-over, or a Java binary exited with code 3, which is how
-`-XX:+ExitOnOutOfMemoryError` ends a JVM that ran out of heap; then
-`runtime_error` for any other non-zero exit or signal; otherwise `accepted`.
+over, a Java binary exited with code 3, which is how
+`-XX:+ExitOnOutOfMemoryError` ends a JVM that ran out of heap, or the kernel
+killed the binary for the container's memory, which the container's
+`memory.events` counts; then `runtime_error` for any other non-zero exit or
+signal; otherwise `accepted`. The last of these catches memory no process's
+share counts, such as files a run keeps in its directory under `/tmp`, which
+is memory too and is charged to the container.
+
+A run stopped at a limit has its binary killed and `sandbox-exec` woken, in
+case the run stopped it with `SIGSTOP` where Landlock does not keep signals
+in, so the item ends within a second of the limit.
 
 Memory is resident memory, the pages the binary actually touched, so an
 array that is declared but never used does not count against it.

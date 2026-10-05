@@ -54,7 +54,11 @@ program spends at most a fifth of its time on it however much memory the run
 holds, and the run, which shares the container's one CPU with it, keeps the
 rest.
 """
-STRAY_SECONDS = 5.0
+STRAY_SECONDS = 1.0
+"""How long a stopped run's helper has to report before its whole group is
+killed."""
+REAP_SECONDS = 5.0
+OOM_EVENTS = Path("/sys/fs/cgroup/memory.events")
 JAVA_OUT_OF_MEMORY = 3
 RUN_PATH = "/usr/local/bin:/usr/bin:/bin"
 HELPER = "/usr/local/bin/sandbox-exec"
@@ -198,6 +202,7 @@ class Run:
     memory_kb: int
     output_bytes: int
     stopped: str | None
+    out_of_memory: bool = False
 
 
 @dataclass
@@ -498,6 +503,7 @@ def execute(
     stopped: str | None = None
     stopped_at = 0.0
     memory = RunMemory()
+    killed_before = oom_kills()
     cpu = 0.0
     me = os.getpid()
     while True:
@@ -519,6 +525,11 @@ def execute(
             if stopped:
                 stopped_at = now
                 kill(pid or -helper.pid)
+                # The run may have stopped `sandbox-exec` with SIGSTOP where
+                # Landlock does not scope signals, and a stopped helper never
+                # reaps the binary; woken, it reports at once, and whatever
+                # is left goes after STRAY_SECONDS.
+                wake(helper.pid)
         elif now - stopped_at > STRAY_SECONDS:
             kill(-helper.pid)
         time.sleep(POLL_SECONDS)
@@ -556,6 +567,7 @@ def execute(
         memory_kb=max(maxrss_kb, memory.peak_kb),
         output_bytes=os.fstat(stdout.fileno()).st_size,
         stopped=stopped,
+        out_of_memory=returncode == -signal.SIGKILL and oom_kills() > killed_before,
     )
 
 
@@ -628,7 +640,10 @@ def judge(run: Run, item: Item, kind: str) -> str:
     The limit the run was stopped for comes first. Otherwise the output limit,
     the time limits and the memory limit are checked in that order against
     what was measured and how the run ended, and any other failure is a
-    runtime error. A jar that ran out of Java heap exits with code 3.
+    runtime error. A jar that ran out of Java heap exits with code 3, and a
+    run the kernel killed for the container's memory is over the memory
+    limit too: memory a run keeps where no process's share counts it, in
+    files under its own `/tmp`, is still charged to the container.
     """
     if run.stopped:
         return {"time": "time_limit", "memory": "memory_limit"}.get(
@@ -642,8 +657,10 @@ def judge(run: Run, item: Item, kind: str) -> str:
         or run.wall_seconds > item.wall_limit
     ):
         return "time_limit"
-    if run.memory_kb > item.memory_limit_kb or (
-        kind == "java" and run.returncode == JAVA_OUT_OF_MEMORY
+    if (
+        run.memory_kb > item.memory_limit_kb
+        or run.out_of_memory
+        or (kind == "java" and run.returncode == JAVA_OUT_OF_MEMORY)
     ):
         return "memory_limit"
     if run.returncode != 0:
@@ -727,6 +744,30 @@ def proportional_memory(pid: int, resident_kb: int) -> int:
     return 0
 
 
+def oom_kills() -> int:
+    """How many processes the kernel has killed in this container for want
+    of memory, from its cgroup's `memory.events`, readable even where the
+    cgroup is not writable; 0 where there is no such file.
+    """
+    try:
+        events = OOM_EVENTS.read_text()
+    except OSError:
+        return 0
+    for line in events.splitlines():
+        name, _, count = line.partition(" ")
+        if name == "oom_kill":
+            return int(count)
+    return 0
+
+
+def wake(pid: int) -> None:
+    """Continue a process that may have been stopped."""
+    try:
+        os.kill(pid, signal.SIGCONT)
+    except ProcessLookupError, PermissionError:
+        pass
+
+
 def kill(pid: int) -> None:
     """Kill one process, or a whole process group when `pid` is negative."""
     try:
@@ -741,7 +782,7 @@ def reap_strays() -> None:
     This program is the subreaper of everything it starts, so a process that
     outlived the run, even one that left its session, is one of its children.
     """
-    deadline = time.monotonic() + STRAY_SECONDS
+    deadline = time.monotonic() + REAP_SECONDS
     while time.monotonic() < deadline:
         for pid in child_pids():
             try:
