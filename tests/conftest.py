@@ -8,7 +8,7 @@ and pids limits, one CPU, a small noexec tmpfs at /tmp and the working
 directory at /work. They are skipped when Docker is not reachable.
 
 The contract checks use `primitive.schema.json` from `PRIMITIVE_SCHEMA`, or
-from a runner checkout beside this one when it has the version 4 declaration.
+from a runner checkout beside this one, when it is the version 5 contract.
 
 Native and Java binaries come from the compile primitive's image, named by
 `COMPILE_IMAGE` or built from a primitive-compile checkout beside this one;
@@ -34,6 +34,7 @@ from referencing import Registry, Resource
 from support import (
     NAME,
     ROOT,
+    SCHEMA_VERSION,
     SIBLING_COMPILE,
     SIBLING_SCHEMA,
     Check,
@@ -136,38 +137,60 @@ def compile_image(image: str) -> str:
 
 @pytest.fixture
 def compiled(compile_image: str, tmp_path_factory: pytest.TempPathFactory) -> Compiled:
-    """Compile a source with the compile primitive and return the binary."""
+    """Compile a source with the compile primitive and return the binary.
+
+    The source goes in as compile's `source` folder holding the one file, in
+    contract version 5. A compile image that answers it speaks another
+    version, as the compile v1 image speaks 4 with `source` a file, is asked
+    again in that shape, so these tests run against either.
+    """
 
     def build(language: str, name: str, source: str) -> bytes:
         work = tmp_path_factory.mktemp("compile")
-        (work / "in").mkdir()
-        (work / "in" / name).write_text(source)
-        document = {
-            "schema_version": 4,
-            "inputs": {"source": {"file": f"in/{name}"}, "language": language},
-        }
-        (work / "inputs.json").write_text(json.dumps(document))
-        open_up(work)
-        flags = sandbox_flags({"memory_mb": 1024, "pids": 128})
-        command = ["docker", "run", "--rm", *flags, "--volume", f"{work}:/work"]
-        subprocess.run([*command, compile_image], check=True, timeout=120)
-        result = json.loads((work / "outputs.json").read_text(encoding="utf-8"))
+        folder = work / "in" / "1" / "source"
+        folder.mkdir(parents=True)
+        (folder / name).write_text(source)
+        inputs = {"source": {"folder": "in/1/source"}, "language": language}
+        result = compile_once(
+            compile_image, work, {"schema_version": SCHEMA_VERSION, "inputs": inputs}
+        )
+        if "contract version" in result.get("error", ""):
+            inputs = {"source": {"file": f"in/1/source/{name}"}, "language": language}
+            document = {"schema_version": 4, "inputs": inputs}
+            result = compile_once(compile_image, work, document)
         assert result["outputs"]["outcome"] == "accepted", result
-        return (work / "out" / "binary").read_bytes()
+        return (work / str(result["outputs"]["binary"]["file"])).read_bytes()
 
     return build
 
 
+def compile_once(
+    compile_image: str, work: Path, document: dict[str, Any]
+) -> dict[str, Any]:
+    """Run the compile image once over `work` with `document` as inputs.json."""
+    (work / "inputs.json").write_text(json.dumps(document))
+    open_up(work)
+    flags = sandbox_flags({"memory_mb": 1024, "pids": 128})
+    command = ["docker", "run", "--rm", *flags, "--volume", f"{work}:/work"]
+    subprocess.run([*command, compile_image], check=True, timeout=120)
+    result: dict[str, Any] = json.loads(
+        (work / "outputs.json").read_text(encoding="utf-8")
+    )
+    return result
+
+
 @pytest.fixture(scope="session")
 def schema() -> dict[str, Any]:
-    """The runner's primitive.schema.json at contract version 4."""
+    """The runner's primitive.schema.json at contract version 5."""
     named = os.environ.get("PRIMITIVE_SCHEMA")
     path = Path(named) if named else SIBLING_SCHEMA
     if not path.is_file():
         pytest.skip("no primitive.schema.json; set PRIMITIVE_SCHEMA")
     document: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
-    if "declaration" not in document.get("$defs", {}):
-        pytest.skip(f"{path} is not the version 4 contract")
+    inputs = document.get("$defs", {}).get("inputs_file", {})
+    version = inputs.get("properties", {}).get("schema_version", {}).get("const")
+    if version != SCHEMA_VERSION:
+        pytest.skip(f"{path} is not the version {SCHEMA_VERSION} contract")
     return document
 
 

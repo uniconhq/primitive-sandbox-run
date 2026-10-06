@@ -4,13 +4,15 @@
 The harness mounts a working directory at `/work` (or the directory named by
 the first argument) holding `inputs.json` and the files under `in/`. The
 inputs are a batch: one item per test, each naming the binary, the input to
-feed it on standard input, a time limit in seconds and a memory limit in
-megabytes. For every item this program runs the binary, keeps what it printed
-as `out/<id>/output`, and reports the CPU time, the peak memory and an
+feed it on standard input, optional arguments for its command line, a time
+limit in seconds and a memory limit in megabytes. For every item this program
+runs the binary, keeps what it printed as `out/<n>/output`, `n` being the
+item's place in the batch, and reports the CPU time, the peak memory and an
 outcome, then writes `outputs.json` with one entry per item in the same order.
 
 A run that goes over a limit is an ordinary result (`time_limit`,
-`memory_limit`, `output_limit`, `runtime_error`), never an error of the step.
+`memory_limit`, `output_limit`, `runtime_error`), never an error of the step,
+and every item reports its time and memory whatever its outcome.
 `error` in `outputs.json` is kept for the cases where the primitive could not
 work at all, such as a missing input or a binary in no format it runs.
 
@@ -43,7 +45,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 OUTPUT_LIMIT = 32 * 1024 * 1024
 POLL_SECONDS = 0.005
 TOTAL_SPACING = 4.0
@@ -68,13 +70,20 @@ NO_CGROUP = (
 JAVA_OUT_OF_MEMORY = 3
 RUN_PATH = "/usr/local/bin:/usr/bin:/bin"
 HELPER = "/usr/local/bin/sandbox-exec"
-ITEM_ID = re.compile(r"[^/\x00-\x1f]{1,255}")
+TEST_ID = re.compile(r"[A-Za-z0-9_-]+/[A-Za-z0-9_-]+")
+"""A test's id, `<group>/<test>`. It holds a `/`, so no file is named after
+it: an item's output goes under its place in the batch.
+"""
 REPORT_LINE = re.compile(rb"([PLER]) (-?[0-9]{1,20}(?: -?[0-9]{1,20}){0,3})\n")
 REFUSED_BINARY = frozenset(
     {errno.ENOEXEC, errno.ENOMEM, errno.E2BIG, errno.EINVAL, errno.ELIBBAD}
 )
 """What the kernel answers when it will not run a native binary as built: the
 contestant's program, not the step, failed.
+"""
+REFUSED_ARGUMENTS = frozenset({errno.E2BIG})
+"""What the kernel answers when the command line is too long for it, which
+only `args` can make it: the contestant's input, not the step, failed.
 """
 ELF_MAGIC = b"\x7fELF"
 
@@ -125,19 +134,23 @@ class PrimitiveError(Exception):
     """The primitive could not do its work at all.
 
     The message is one sentence for a person and becomes `error` in
-    `outputs.json`, which the harness turns into a `system_error` verdict.
+    `outputs.json`, which the harness turns into a `system_error`.
     """
 
 
 @dataclass(frozen=True)
 class Item:
-    """One test to run: its id, the binary, the input and the two limits."""
+    """One test to run: its id, its place in the batch from 1, the binary, the
+    input, the two limits and the arguments.
+    """
 
-    id: str
+    test: str
+    number: int
     binary: Path
     input: Path
     time_limit: float
     memory_limit: float
+    args: tuple[str, ...] = ()
 
     @property
     def wall_limit(self) -> float:
@@ -152,6 +165,14 @@ class Item:
     def memory_limit_kb(self) -> int:
         """The memory limit in kilobytes, the unit peak memory is measured in."""
         return int(self.memory_limit * 1024)
+
+    @property
+    def time_limit_ms(self) -> int:
+        """The time limit in whole milliseconds, rounded up: the least time a
+        run stopped at it reports. Rounding to a microsecond first keeps a
+        limit such as 0.1 s, a little over 100 ms as a float, at 100.
+        """
+        return math.ceil(round(self.time_limit * 1000, 3))
 
 
 @dataclass(frozen=True)
@@ -173,11 +194,14 @@ class Program:
         return [self.path]
 
     def command(self, item: Item) -> list[str]:
-        """The command line that runs this binary for one item."""
+        """The command line that runs this binary for one item, the item's
+        arguments last.
+        """
         if self.kind == "native":
-            return [str(self.path)]
+            return [str(self.path), *item.args]
         if self.kind == "python":
-            return [os.path.realpath(sys.executable), "-I", "-B", str(self.path)]
+            interpreter = os.path.realpath(sys.executable)
+            return [interpreter, "-I", "-B", str(self.path), *item.args]
         java = shutil.which("java", path=RUN_PATH)
         if java is None:
             raise PrimitiveError("this image has no Java runtime to run a jar with")
@@ -191,6 +215,7 @@ class Program:
             "-Djava.io.tmpdir=.",
             "-jar",
             str(self.path),
+            *item.args,
         ]
 
 
@@ -303,56 +328,68 @@ def read_inputs(root: Path) -> list[Item]:
     batch = document.get("batch")
     if not isinstance(batch, list):
         raise PrimitiveError("inputs.json has no batch list")
-    items = [read_item(root, entry) for entry in batch]
-    if len({item.id for item in items}) != len(items):
-        raise PrimitiveError("two items in the batch have the same id")
+    items = [read_item(root, entry, number) for number, entry in enumerate(batch, 1)]
+    if len({item.test for item in items}) != len(items):
+        raise PrimitiveError("two items in the batch are for the same test")
     return items
 
 
-def read_item(root: Path, entry: object) -> Item:
-    """Check one batch entry and return it as an item."""
+def read_item(root: Path, entry: object, number: int) -> Item:
+    """Check one batch entry, the `number`th, and return it as an item."""
     if not isinstance(entry, dict) or not isinstance(entry.get("inputs"), dict):
         raise PrimitiveError("a batch item has no inputs object")
-    item_id = entry.get("id")
-    if (
-        not isinstance(item_id, str)
-        or not ITEM_ID.fullmatch(item_id)
-        or item_id in (".", "..")
-    ):
-        raise PrimitiveError(f"the batch item id {item_id!r} cannot name a directory")
+    test = entry.get("test")
+    if not isinstance(test, str) or len(test) > 255 or not TEST_ID.fullmatch(test):
+        raise PrimitiveError(f"the batch item test {test!r} is not a test id")
     inputs = entry["inputs"]
     return Item(
-        id=item_id,
-        binary=input_file(root, inputs, "binary", item_id),
-        input=input_file(root, inputs, "input", item_id),
-        time_limit=positive_number(inputs, "time_limit", item_id),
-        memory_limit=positive_number(inputs, "memory_limit", item_id),
+        test=test,
+        number=number,
+        binary=input_file(root, inputs, "binary", test),
+        input=input_file(root, inputs, "input", test),
+        time_limit=positive_number(inputs, "time_limit", test),
+        memory_limit=positive_number(inputs, "memory_limit", test),
+        args=arguments(inputs, test),
     )
 
 
-def input_file(root: Path, inputs: dict[str, object], name: str, item_id: str) -> Path:
+def input_file(root: Path, inputs: dict[str, object], name: str, test: str) -> Path:
     """Resolve a file input to a path, refusing anything outside `in/`."""
     value = inputs.get(name)
     if not isinstance(value, dict) or not isinstance(value.get("file"), str):
-        raise PrimitiveError(f"the input named {name} of item {item_id} is not a file")
+        raise PrimitiveError(f"the input named {name} of test {test} is not a file")
     path = (root / str(value["file"])).resolve()
     if not path.is_relative_to((root / "in").resolve()):
-        raise PrimitiveError(f"the input named {name} of item {item_id} is outside in/")
+        raise PrimitiveError(f"the input named {name} of test {test} is outside in/")
     if not path.is_file():
         raise PrimitiveError(
-            f"the input named {name} of item {item_id} is not in the working directory"
+            f"the input named {name} of test {test} is not in the working directory"
         )
     return path
 
 
-def positive_number(inputs: dict[str, object], name: str, item_id: str) -> float:
+def positive_number(inputs: dict[str, object], name: str, test: str) -> float:
     """Read a number input that must be above zero."""
     value = inputs.get(name)
     if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
         raise PrimitiveError(
-            f"the input named {name} of item {item_id} is not a positive number"
+            f"the input named {name} of test {test} is not a positive number"
         )
     return float(value)
+
+
+def arguments(inputs: dict[str, object], test: str) -> tuple[str, ...]:
+    """Read `args`, the optional text appended to the binary's command line,
+    split on spaces: a run of spaces separates two arguments, and spaces at
+    either end separate nothing. There is no quoting, so no argument holds a
+    space. Absent, the binary gets no arguments.
+    """
+    value = inputs.get("args")
+    if value is None:
+        return ()
+    if not isinstance(value, str):
+        raise PrimitiveError(f"the input named args of test {test} is not text")
+    return tuple(part for part in value.split(" ") if part)
 
 
 def run_batch(root: Path, items: list[Item]) -> list[dict[str, object]]:
@@ -396,7 +433,7 @@ def run_all(root: Path, items: list[Item]) -> list[dict[str, object]]:
             if item.binary not in programs:
                 programs[item.binary] = prepare(item.binary, scratch, len(programs))
             outputs = run_item(root, item, programs[item.binary], abi)
-            results.append({"id": item.id, "outputs": outputs})
+            results.append({"test": item.test, "outputs": outputs})
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     return results
@@ -440,8 +477,16 @@ def prepare(binary: Path, scratch: Path, number: int) -> Program:
 
 
 def run_item(root: Path, item: Item, program: Program, abi: int) -> dict[str, object]:
-    """Run one item and return its outputs."""
-    out = root / "out" / item.id
+    """Run one item and return its outputs, all of them whatever the outcome:
+    what the binary printed, its CPU time and its peak memory.
+
+    The time is the CPU time, and on `time_limit` at least the limit: a run
+    the wall clock stopped, one that slept or waited, used little CPU. An
+    argument holding a NUL character, which no command line can carry, is a
+    run that could not start, a `runtime_error`, like a binary the kernel
+    will not run.
+    """
+    out = root / "out" / str(item.number)
     out.mkdir(parents=True, exist_ok=True)
     output = out / "output"
     cwd = Path(tempfile.mkdtemp(prefix="run-"))
@@ -450,17 +495,24 @@ def run_item(root: Path, item: Item, program: Program, abi: int) -> dict[str, ob
             output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644
         )
         with item.input.open("rb") as stdin, os.fdopen(descriptor, "wb") as stdout:
-            run = execute(program, cwd, stdin, stdout, item, abi)
+            if any("\0" in argument for argument in item.args):
+                run = Run(127, 0.0, 0.0, 0, 0, None)
+            else:
+                run = execute(program, cwd, stdin, stdout, item, abi)
     finally:
         reap_strays()
         shutil.rmtree(cwd, ignore_errors=True)
     if run.output_bytes > OUTPUT_LIMIT:
         os.truncate(output, OUTPUT_LIMIT)
+    outcome = judge(run, item, program.kind)
+    time_ms = round(run.cpu_seconds * 1000)
+    if outcome == "time_limit":
+        time_ms = max(time_ms, item.time_limit_ms)
     return {
-        "output": {"file": f"out/{item.id}/output"},
-        "time_ms": round(run.cpu_seconds * 1000),
+        "output": {"file": f"out/{item.number}/output"},
+        "time_ms": time_ms,
         "memory_kb": run.memory_kb,
-        "outcome": judge(run, item, program.kind),
+        "outcome": outcome,
     }
 
 
@@ -490,6 +542,10 @@ def execute(
     that of every process the run left behind, which this program reaps, so a
     run cannot hide work in a child it never waits for. A run that kills
     `sandbox-exec` is judged on what this program measured itself.
+
+    A command line too long for the kernel, which only the item's arguments
+    can make, is a run that could not start, judged as a native binary the
+    kernel will not run is.
     """
     env = {"PATH": RUN_PATH, "HOME": str(cwd), "TMPDIR": str(cwd), "LANG": "C.UTF-8"}
     try:
@@ -516,6 +572,8 @@ def execute(
         )
     except (OSError, subprocess.SubprocessError) as error:
         os.close(read_end)
+        if isinstance(error, OSError) and error.errno in REFUSED_ARGUMENTS:
+            return Run(127, 0.0, 0.0, 0, 0, None)
         raise PrimitiveError(f"the binary could not be started: {error}") from None
     finally:
         os.close(write_end)
@@ -569,7 +627,8 @@ def execute(
         )
     if "E" in lines:
         refused = lines["E"][0]
-        if program.kind != "native" or refused not in REFUSED_BINARY:
+        contestants = REFUSED_BINARY if program.kind == "native" else frozenset()
+        if refused not in contestants | REFUSED_ARGUMENTS:
             raise PrimitiveError(
                 f"the binary could not be started: {os.strerror(refused)}"
             )

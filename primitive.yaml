@@ -1,14 +1,14 @@
-name: unicon/sandbox-run
-version: v1
 batch: true
-limits: {time_ms: 5000, cpu_ms: 5000, memory_mb: 256, pids: 128, output_mb: 64}
+network: false
+limits: {time_ms: 5000, cpu_ms: 5000, memory_mb: 256, pids: 128, output_mb: 64, gpus: 0}
 limits_from:
   time_ms: {input: time_limit, scale: 2000, add: 3000}
   cpu_ms: {input: time_limit, scale: 2000, add: 3000}
-  memory_mb: {input: memory_limit, scale: 1, add: 256}
+  memory_mb: {input: memory_limit, add: 256}
 inputs:
-  binary: {type: file}
-  input: {type: file}
+  binary: {type: file, runs: true}
+  input: {type: file, runs: false}
+  args: {type: text, optional: true}
   time_limit: {type: number}
   memory_limit: {type: number}
 outputs:

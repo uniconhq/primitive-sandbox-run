@@ -1,6 +1,7 @@
 """What the tests share: the declaration, the sandbox flags and test inputs."""
 
 import json
+import math
 import zipapp
 from collections.abc import Callable
 from pathlib import Path
@@ -10,6 +11,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 NAME = "primitive-sandbox-run"
+SCHEMA_VERSION = 5
 SIBLING_SCHEMA = ROOT.parent / "runner" / "schemas" / "primitive.schema.json"
 SIBLING_COMPILE = ROOT.parent / "primitive-compile"
 
@@ -29,8 +31,8 @@ def container_limits(
 ) -> dict[str, int]:
     """The container limits the harness gives a batch, from the declaration.
 
-    Each limit is raised by `limits_from` for the item's inputs; a batch's
-    time and CPU are the per-item value times the number of items.
+    Each limit is raised by `limits_from` for the item's inputs, rounded up;
+    a batch's time and CPU are the per-item value times the number of items.
     """
     document = declaration()
     inputs = {"time_limit": time_limit, "memory_limit": memory_limit}
@@ -38,7 +40,8 @@ def container_limits(
     for name, value in document["limits"].items():
         rule = document.get("limits_from", {}).get(name)
         if rule:
-            value = max(value, int(inputs[rule["input"]] * rule["scale"] + rule["add"]))
+            raised = inputs[rule["input"]] * rule.get("scale", 1) + rule.get("add", 0)
+            value = max(value, math.ceil(raised))
         limits[name] = value * items if name in ("time_ms", "cpu_ms") else value
     return limits
 
@@ -68,7 +71,10 @@ def open_up(work: Path) -> None:
 
 
 def python_binary(path: Path, source: str) -> Path:
-    """Build a Python binary the way the compile primitive does."""
+    """Build a Python binary in compile's format at its simplest: a zip
+    application whose root `__main__.py` is the program itself, where compile
+    puts a launcher that runs the entry from the folder under `source/`.
+    """
     app = path.parent / (path.name + ".app")
     app.mkdir(parents=True)
     (app / "__main__.py").write_text(source)
@@ -82,40 +88,43 @@ def batch_inputs(
     items: list[tuple[str, str]],
     time_limit: float = 1.0,
     memory_limit: float = 64,
+    args: dict[str, str] | None = None,
 ) -> None:
-    """Write inputs.json, the binary and one input per item under `in/`.
+    """Write inputs.json, the binary and one input per item under `in/`, as the
+    harness does: the binary is `in/1/binary` and the nth item's input
+    `in/<n + 1>/input`.
 
-    `items` are (id, standard input) pairs, all run under the same limits.
+    `items` are (test, standard input) pairs, all run under the same limits;
+    `args` gives the `args` input of the tests it names, and the others have
+    none.
     """
     (work / "in" / "1").mkdir(parents=True)
     (work / "in" / "1" / "binary").write_bytes(binary)
-    (work / "in" / "2").mkdir()
     batch = []
-    for item_id, stdin in items:
-        (work / "in" / "2" / f"{item_id}.in").write_text(stdin)
-        batch.append(
-            {
-                "id": item_id,
-                "inputs": {
-                    "binary": {"file": "in/1/binary"},
-                    "input": {"file": f"in/2/{item_id}.in"},
-                    "time_limit": time_limit,
-                    "memory_limit": memory_limit,
-                },
-            }
-        )
-    document = {"schema_version": 4, "batch": batch}
+    for number, (test, stdin) in enumerate(items, 2):
+        (work / "in" / str(number)).mkdir()
+        (work / "in" / str(number) / "input").write_text(stdin)
+        inputs: dict[str, Any] = {
+            "binary": {"file": "in/1/binary"},
+            "input": {"file": f"in/{number}/input"},
+            "time_limit": time_limit,
+            "memory_limit": memory_limit,
+        }
+        if args and test in args:
+            inputs["args"] = args[test]
+        batch.append({"test": test, "inputs": inputs})
+    document = {"schema_version": SCHEMA_VERSION, "batch": batch}
     (work / "inputs.json").write_text(json.dumps(document))
 
 
 def peek_input(work: str) -> str:
-    """The standard input of a `peek` run after a run named `first`: the paths
-    it tries to read, which are the other run's output and input, the step's
-    own files and directories, the rest of /tmp, and one system file.
+    """The standard input of a `peek` run after a first run: the paths it
+    tries to read, which are the other run's output and input, the step's own
+    files and directories, the rest of /tmp, and one system file.
     """
     paths = [
-        f"{work}/out/first/output",
-        f"{work}/in/2/first.in",
+        f"{work}/out/1/output",
+        f"{work}/in/2/input",
         f"{work}/inputs.json",
         f"{work}/out",
         work,
@@ -128,8 +137,8 @@ def peek_input(work: str) -> str:
 def peeked(work: str) -> list[str]:
     """What a `peek` run prints when only the system file can be read."""
     return [
-        f"refused {work}/out/first/output 13",
-        f"refused {work}/in/2/first.in 13",
+        f"refused {work}/out/1/output 13",
+        f"refused {work}/in/2/input 13",
         f"refused {work}/inputs.json 13",
         f"refused {work}/out 13",
         f"refused {work} 13",
@@ -138,9 +147,14 @@ def peeked(work: str) -> list[str]:
     ]
 
 
-def by_id(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """A batch's outputs keyed by item id."""
-    return {entry["id"]: entry["outputs"] for entry in result["batch"]}
+def by_test(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """A batch's outputs keyed by test."""
+    return {entry["test"]: entry["outputs"] for entry in result["batch"]}
+
+
+def printed(work: Path, outputs: dict[str, Any]) -> str:
+    """What one item's binary printed, from the file its `output` names."""
+    return (work / str(outputs["output"]["file"])).read_text()
 
 
 PROGRAM = """
@@ -164,6 +178,8 @@ elif case == "flood":
 elif case == "fail":
     print("partial")
     sys.exit(3)
+elif case == "argv":
+    print(repr(sys.argv[1:]))
 elif case == "escape":
     work = sys.stdin.readline().strip()
     for path in (work + "/escaped", work + "/inputs.json", "/tmp/escaped"):
