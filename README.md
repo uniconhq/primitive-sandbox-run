@@ -1,9 +1,10 @@
 # primitive-sandbox-run
 
-The `unicon/sandbox-run` primitive: it runs one compiled binary once per test,
-feeding each test's input on standard input, and reports what the binary
-printed, the CPU time and memory it used, and an outcome. It is the second
-step of the `unicon/classic` workflow, between `unicon/compile` and
+The `unicon/sandbox-run` primitive, at the forge `unicon/sandbox-run@v2`: it
+runs one compiled binary once per test, feeding each test's input on standard
+input and any arguments the task gives on its command line, and reports what
+the binary printed, the CPU time and memory it used, and an outcome. It is the
+second step of the `unicon/classic` workflow, between `unicon/compile` and
 `unicon/diff-check`.
 
 This repo holds the image, `ghcr.io/uniconhq/primitive-sandbox-run`, built
@@ -11,40 +12,78 @@ from the `Dockerfile`; the program the image runs, `src/sandbox_run.py`; the
 small C program every binary is started through, `src/sandbox-exec.c`; and
 `primitive.yaml`, the declaration the forge compiler reads to type-check a
 workflow that uses the primitive. The program speaks the primitive contract,
-`primitive.schema.json` version 4, published by the
+`primitive.schema.json` version 5, published by the
 [runner](https://github.com/uniconhq/runner).
 
 ## What it takes and returns
 
 The primitive takes a batch (`batch: true`): one container runs every test,
 so a hundred tests cost one container start rather than a hundred. Each item
-of the batch has these inputs and outputs.
+of the batch is keyed by its test, `<group>/<test>`, and `outputs.json`
+answers in the same order under the same tests. Each item has these inputs
+and outputs.
 
 | | Name | Type | What it is |
 |---|---|---|---|
-| Input | `binary` | file | The binary from compile, in one of the formats below |
-| Input | `input` | file | What the binary reads on standard input |
+| Input | `binary` | file, `runs: true` | The binary from compile, in one of the formats below |
+| Input | `input` | file, `runs: false` | What the binary reads on standard input |
+| Input | `args` | text, optional | Appended to the binary's command line, split on spaces |
 | Input | `time_limit` | number | Seconds of CPU time the run may use |
 | Input | `memory_limit` | number | Megabytes of memory the run may use |
-| Output | `output` | file | `out/<test id>/output`, what the binary printed on standard output |
-| Output | `time_ms` | number | CPU time used, user plus system, in milliseconds |
+| Output | `output` | file | `out/<n>/output`, `n` the item's place in the batch from 1, what the binary printed on standard output |
+| Output | `time_ms` | number | CPU time used, user plus system, in milliseconds; on `time_limit` at least the limit |
 | Output | `memory_kb` | number | Peak resident memory of the run, all its processes together (below), in kilobytes |
 | Output | `outcome` | outcome | `accepted`, `time_limit`, `memory_limit`, `output_limit` or `runtime_error` |
 
-A run that goes over a limit or crashes is an ordinary result for that test,
-never a failure of the step: the other tests still run, and the harness skips
-the later steps of that test only.
+The output goes under the item's place in the batch, not its test, because a
+test id holds a `/`.
+
+**`args`** is split on spaces: a run of spaces separates two arguments, and
+spaces at either end separate nothing. There is no quoting, so no argument
+holds a space. Absent or empty, the binary gets no arguments. The arguments
+come after the binary on the command line: `binary <args>`, `python3 -I -B
+binary <args>`, `java ... -jar binary <args>`. An argument no command line can
+carry, one holding a NUL character or longer than the kernel takes, is the
+run failing to start, a `runtime_error`.
+
+## What it promises
+
+The task's save does not check these; the scoring rules rely on them.
+
+- **The binary cannot fault the run.** Everything the binary can do is an
+  outcome of its own item: going over the time, memory or output limit is
+  `time_limit`, `memory_limit` or `output_limit`, and crashing, exiting
+  non-zero, failing to start or killing `sandbox-exec`, the process that
+  started it, is `runtime_error`. It cannot fill `/work`, where it writes only
+  its standard output, cut at 32 MB, nor stop or starve the program, which
+  holds it to limits inside the container's own. The other tests still run,
+  and the harness skips the later steps of that test only. None of it is ever
+  `error`, a container killed at its limit or an output over the harness's
+  caps.
+- **Every item reports its time and memory, whatever its outcome.**
+  `output`, `time_ms`, `memory_kb` and `outcome` are written for every item.
+  `time_ms` is the CPU time, and on `time_limit` at least the time limit in
+  milliseconds, rounded up, whether the CPU limit or the wall clock stopped
+  the run: a run that sleeps or waits until the wall clock stops it reports
+  the limit, never the few milliseconds of CPU it used. `memory_kb` is its
+  peak memory, 0 for a run that could not start.
+- **Each item is kept apart from the others.** Every test is a new process in
+  a new, empty directory, and no run can read or change another test's
+  files (below).
+- **`args` is not `secret`.** It lands on the contestant program's command
+  line, where the program reads it, so a task cannot wire a secret into it.
 
 `outputs.json` carries `error` instead, and nothing else, only when the
 primitive could not work at all: `inputs.json` is missing, is not JSON or is
 for another contract version; a file is missing or lies outside `in/`; a
-limit is not a positive number; two items share an id, or an id cannot name
-a directory; the binary is in none of the three formats; the interpreter a
-Python or Java binary needs could not be started; the machine's kernel does
-not offer Landlock, or a run could not be put under its Landlock rules; or
-processes a run left behind could not be stopped. The harness turns an error into a `system_error` verdict, so no
-contestant is graded by a broken step. A native binary the kernel refuses to
-run as built is the contestant's program failing, a `runtime_error`.
+limit is not a positive number, or `args` is not text; an item's test is not
+a test id, or two items are for the same test; the binary is in none of the
+three formats; the interpreter a Python or Java binary needs could not be
+started; the machine's kernel does not offer Landlock, or a run could not be
+put under its Landlock rules; or processes a run left behind could not be
+stopped. The harness turns an error into a `system_error`, so no contestant
+is graded by a broken step. A native binary the kernel refuses to run as
+built is the contestant's program failing, a `runtime_error`.
 
 ## How one run goes
 
@@ -53,10 +92,10 @@ For each item, in order:
 1. A fresh, empty directory is made under `/tmp` and becomes the run's
    working directory, `HOME` and `TMPDIR`. The environment holds only those,
    `PATH` and `LANG=C.UTF-8`.
-2. The input file is opened as standard input, `out/<id>/output` as standard
+2. The input file is opened as standard input, `out/<n>/output` as standard
    output, and standard error goes nowhere.
-3. The binary is started through `sandbox-exec`, with its limits already set
-   (below), and watched until it ends.
+3. The binary is started through `sandbox-exec`, with its arguments and its
+   limits already set (below), and watched until it ends.
 4. Every process the run left behind is killed and reaped, and the directory
    is removed.
 
@@ -166,24 +205,40 @@ exits, because `/tmp` may be mounted `noexec`.
 
 ## The container's limits
 
-`limits` in `primitive.yaml` are per test: 5 s of time and CPU, 256 MB of
-memory, 128 processes and 64 MB of output. `limits_from` raises them from
-each test's own limits so the container never dies before the program's own
-limit does: time and CPU to `2 × time_limit + 3` seconds (the wall-clock
-limit plus room to start and clean up), and memory to `memory_limit + 256` MB
-(room for the program itself and for the moment between two memory
-readings). The `forge` repo's compiler adds up time and CPU over the tests
-of the batch when it writes the plan.
+`limits` in `primitive.yaml` are per test: 2 s of time and CPU, 256 MB of
+memory, 128 processes, 64 MB of output and no GPUs, with no network
+(`network: false`). `limits_from` raises them from each test's own limits
+so the container never dies before the program's own limit does, and they
+are raised for every test, since every test has a `time_limit`. Time and
+CPU go to `2 × time_limit + 3` seconds, what one test can take at most:
+
+- the wall-clock limit, `2 × time_limit + 1` seconds, which a run that
+  sleeps or waits reaches;
+- up to one second more when a run keeps `sandbox-exec` from reporting,
+  before its whole process group is killed (see "Limits and outcomes");
+- and about a second for the rest: starting the run under Landlock, reaping
+  what it left behind and removing its directory, and this program's own
+  start, once per batch. A sleeping run took 0.2 to 0.6 s beyond the
+  wall-clock limit per test, and a batch 1.5 to 2 s to start, measured in
+  the image under the harness's flags with one CPU on a loaded laptop.
+
+Memory goes to `memory_limit + 256` MB (room for the program itself and for
+the moment between two memory readings). The `forge` repo's compiler adds up
+time and CPU over the tests of the batch when it writes the plan. The
+harness holds the CPU limit as `RLIMIT_CPU` on the container's processes,
+this program among them, and each run lowers its own to the time limit
+rounded up plus a second, which is always below it.
 
 ## The binary format
 
 `binary` is one file, in one of three formats. compile writes them, and
-sandbox-run tells them apart by their content.
+sandbox-run tells them apart by their content: an ELF header, or a zip
+holding a `__main__.py` at its root, or a zip holding a jar manifest.
 
 | Language | The binary | How sandbox-run runs it |
 |---|---|---|
 | `c`, `cpp` | A statically linked ELF executable | Copied to a scratch directory, marked executable and run directly |
-| `python` | A Python zip application: a zip holding the source as `__main__.py`, behind the line `#!/usr/bin/env python3` | `python3 -I -B binary`, on the image's Python 3.14 |
+| `python` | A Python zip application behind the line `#!/usr/bin/env python3`: the source folder under `source/` with its layout, and a `__main__.py` at the root that runs the entry | `python3 -I -B binary`, on the image's Python 3.14 |
 | `java` | A runnable jar: the compiled classes and a manifest naming the main class | `java -Xmx<memory_limit>m -Xss64m -XX:+UseSerialGC -XX:-UsePerfData -XX:+ExitOnOutOfMemoryError -Djava.io.tmpdir=. -jar binary`, on the image's OpenJDK 21 |
 
 Static linking means a native binary needs nothing from the image it runs
@@ -238,9 +293,11 @@ The image tests build their C++, Java and Python binaries with the compile
 primitive's own image, so they are also the check that the two primitives
 agree on the binary format. That image is `COMPILE_IMAGE`, or built from a
 `primitive-compile` checkout beside this one; without either, those tests
-are skipped. CI builds it from `primitive-compile`'s `main`. The checks on
-every `inputs.json` and `outputs.json` the tests see read the schema from
-`PRIMITIVE_SCHEMA`, or from a `runner` checkout beside this one.
+are skipped. CI builds it from `primitive-compile`'s `main`. The tests ask
+it in contract version 5, `source` a folder holding the one file, and ask a
+compile image that speaks version 4, compile v1, again in its own shape.
+The checks on every `inputs.json` and `outputs.json` the tests see read the
+schema from `PRIMITIVE_SCHEMA`, or from a `runner` checkout beside this one.
 
 `.github/workflows/ci.yaml` and `release.yaml` call the workflows every
 primitive shares, `primitive-ci.yaml` and `primitive-release.yaml` in the
@@ -254,12 +311,12 @@ two `uses:` lines and `runner-ref` together.
 
 ## Releasing
 
-Push a tag `v1.2.3` on `main`. The shared release workflow refuses a tag whose
-commit is not on `main`, a tag that differs from the version in
-`pyproject.toml`, and a tag that is not a release of the version
-`primitive.yaml` declares (`v1.2.3` is a release of `v1`). It runs the same
-checks as CI, pushes the image as
-`ghcr.io/uniconhq/primitive-sandbox-run:v1.2.3`, and creates a GitHub release
+Push a tag `v2.1.0` on `main`. The tag's major is the version at the forge:
+`v2.1.0` is a release of `unicon/sandbox-run@v2`, so a change to the ports
+is a new major. The shared release workflow refuses a tag whose commit is not
+on `main` and a tag that differs from the version in `pyproject.toml`. It
+runs the same checks as CI, pushes the image as
+`ghcr.io/uniconhq/primitive-sandbox-run:v2.1.0`, and creates a GitHub release
 with `images.json`, which names the image by digest in the same shape as the
 runner's, and `primitive.yaml` attached, and the digest in the notes.
 `deploy/images.json` pins that digest, and bootstrap writes it into the

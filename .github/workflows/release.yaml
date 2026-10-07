@@ -13,10 +13,10 @@ permissions: {}
 # it needs.
 jobs:
   release:
-    uses: uniconhq/runner/.github/workflows/primitive-release.yaml@v0.5.1
+    uses: uniconhq/runner/.github/workflows/primitive-release.yaml@v0.6.0
     permissions:
       contents: write
       packages: write
     with:
-      runner-ref: v0.5.1
+      runner-ref: v0.6.0
       compile-image: true

@@ -18,7 +18,15 @@ from typing import Any
 import pytest
 
 import sandbox_run
-from support import PROGRAM, batch_inputs, by_id, peek_input, peeked, python_binary
+from support import (
+    PROGRAM,
+    batch_inputs,
+    by_test,
+    peek_input,
+    peeked,
+    printed,
+    python_binary,
+)
 
 
 @pytest.fixture(scope="session")
@@ -39,9 +47,13 @@ def run(helper: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
     monkeypatch.setattr(sandbox_run, "HELPER", helper)
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
 
-    def batch(items: list[tuple[str, str]], **limits: float) -> dict[str, Any]:
+    def batch(
+        items: list[tuple[str, str]],
+        args: dict[str, str] | None = None,
+        **limits: float,
+    ) -> dict[str, Any]:
         work = tmp_path / "work"
-        batch_inputs(work, binary, items, **limits)
+        batch_inputs(work, binary, items, args=args, **limits)
         assert sandbox_run.main(["sandbox-run", str(work)]) == 0
         document: dict[str, Any] = json.loads(
             (work / "outputs.json").read_text(encoding="utf-8")
@@ -64,7 +76,17 @@ def make_run(**changes: Any) -> sandbox_run.Run:
     return sandbox_run.Run(**(fields | changes))
 
 
-ITEM = sandbox_run.Item("1", Path("b"), Path("i"), time_limit=1.0, memory_limit=64)
+ITEM = sandbox_run.Item(
+    "main/1", 1, Path("b"), Path("i"), time_limit=1.0, memory_limit=64
+)
+
+
+@pytest.mark.parametrize(
+    ("limit", "ms"), [(1.0, 1000), (0.1, 100), (0.3, 300), (2.5, 2500), (0.0005, 1)]
+)
+def test_the_time_limit_in_milliseconds_is_rounded_up(limit: float, ms: int) -> None:
+    item = sandbox_run.Item("main/1", 1, Path("b"), Path("i"), limit, 64)
+    assert item.time_limit_ms == ms
 
 
 @pytest.mark.parametrize(
@@ -114,19 +136,20 @@ def test_detect(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("inputs", "message"),
     [
-        ({"time_limit": 0}, "time_limit of item 1 is not a positive number"),
-        ({"time_limit": True}, "time_limit of item 1 is not a positive number"),
-        ({"memory_limit": "64"}, "memory_limit of item 1 is not a positive number"),
-        ({"binary": {"file": "in/../inputs.json"}}, "binary of item 1 is outside in/"),
-        ({"input": {"file": "in/none"}}, "input of item 1 is not in the working"),
-        ({"input": "in/2/1.in"}, "input of item 1 is not a file"),
+        ({"time_limit": 0}, "time_limit of test main/1 is not a positive number"),
+        ({"time_limit": True}, "time_limit of test main/1 is not a positive number"),
+        ({"memory_limit": "64"}, "memory_limit of test main/1 is not a positive"),
+        ({"binary": {"file": "in/../inputs.json"}}, "binary of test main/1 is outside"),
+        ({"input": {"file": "in/none"}}, "input of test main/1 is not in the working"),
+        ({"input": "in/2/input"}, "input of test main/1 is not a file"),
+        ({"args": 3}, "args of test main/1 is not text"),
     ],
 )
 def test_inputs_it_cannot_use_are_an_error(
     tmp_path: Path, inputs: dict[str, Any], message: str
 ) -> None:
     """Anything that stops the primitive working is `error` alone, in one sentence."""
-    batch_inputs(tmp_path, b"", [("1", "")])
+    batch_inputs(tmp_path, b"", [("main/1", "")])
     document = json.loads((tmp_path / "inputs.json").read_text())
     document["batch"][0]["inputs"].update(inputs)
     (tmp_path / "inputs.json").write_text(json.dumps(document))
@@ -137,17 +160,22 @@ def test_inputs_it_cannot_use_are_an_error(
 
 
 @pytest.mark.parametrize(
-    ("ids", "message"),
-    [(["1", "1"], "same id"), ([".."], "cannot name a directory"), (["a/b"], "cannot")],
+    ("tests", "message"),
+    [
+        (["main/1", "main/1"], "for the same test"),
+        (["main"], "is not a test id"),
+        (["main/../1"], "is not a test id"),
+        (["main/1/2"], "is not a test id"),
+    ],
 )
-def test_item_ids_must_name_distinct_directories(
-    tmp_path: Path, ids: list[str], message: str
+def test_items_must_be_for_distinct_tests(
+    tmp_path: Path, tests: list[str], message: str
 ) -> None:
-    """Each item's output goes to out/<id>/, so an id must be a distinct plain name."""
-    batch_inputs(tmp_path, b"", [(str(n), "") for n in range(len(ids))])
+    """Each item names one test, `<group>/<test>`, and no two the same one."""
+    batch_inputs(tmp_path, b"", [(f"main/{n}", "") for n in range(len(tests))])
     document = json.loads((tmp_path / "inputs.json").read_text())
-    for entry, item_id in zip(document["batch"], ids, strict=True):
-        entry["id"] = item_id
+    for entry, test in zip(document["batch"], tests, strict=True):
+        entry["test"] = test
     (tmp_path / "inputs.json").write_text(json.dumps(document))
     sandbox_run.main(["sandbox-run", str(tmp_path)])
     assert message in json.loads((tmp_path / "outputs.json").read_text())["error"]
@@ -155,71 +183,134 @@ def test_item_ids_must_name_distinct_directories(
 
 def test_a_binary_in_no_known_format_is_an_error(tmp_path: Path) -> None:
     """A binary sandbox-run cannot run is the step failing, not the contestant."""
-    batch_inputs(tmp_path, b"#!/bin/sh\n", [("1", "")])
+    batch_inputs(tmp_path, b"#!/bin/sh\n", [("main/1", "")])
     sandbox_run.main(["sandbox-run", str(tmp_path)])
     result = json.loads((tmp_path / "outputs.json").read_text())
     assert "not a native executable" in result["error"]
 
 
 def test_every_outcome(run: Any, tmp_path: Path) -> None:
-    """One batch reaches each outcome, keeps each output and measures each run."""
-    result = run(
-        [
-            ("ok", "double\n21\n"),
-            ("spin", "spin\n"),
-            ("sleep", "sleep\n"),
-            ("grow", "grow\n"),
-            ("fail", "fail\n"),
-        ],
-        time_limit=0.5,
-        memory_limit=64,
-    )
-    outputs = by_id(result)
-    assert [entry["id"] for entry in result["batch"]] == [
-        "ok",
-        "spin",
-        "sleep",
-        "grow",
-        "fail",
-    ]
-    assert {name: entry["outcome"] for name, entry in outputs.items()} == {
-        "ok": "accepted",
-        "spin": "time_limit",
-        "sleep": "time_limit",
-        "grow": "memory_limit",
-        "fail": "runtime_error",
+    """One batch reaches each outcome, keeps each output and measures each run,
+    answering in the batch's order under each item's test, with each output
+    under the item's place in the batch, since a test id holds a `/`.
+    """
+    tests = ["samples/ok", "main/spin", "main/sleep", "main/grow", "main/fail"]
+    cases = ["double\n21\n", "spin\n", "sleep\n", "grow\n", "fail\n"]
+    items = list(zip(tests, cases, strict=True))
+    result = run(items, time_limit=0.5, memory_limit=64)
+    outputs = by_test(result)
+    assert [entry["test"] for entry in result["batch"]] == tests
+    assert {test: entry["outcome"] for test, entry in outputs.items()} == {
+        "samples/ok": "accepted",
+        "main/spin": "time_limit",
+        "main/sleep": "time_limit",
+        "main/grow": "memory_limit",
+        "main/fail": "runtime_error",
     }
     work = tmp_path / "work"
-    assert (work / "out" / "ok" / "output").read_text() == "42\n"
-    assert (work / "out" / "fail" / "output").read_text() == "partial\n"
-    assert outputs["ok"]["output"] == {"file": "out/ok/output"}
-    assert 500 <= outputs["spin"]["time_ms"] < 1500
-    assert outputs["sleep"]["time_ms"] < 500
-    assert outputs["grow"]["memory_kb"] > 64 * 1024
-    assert 0 < outputs["ok"]["memory_kb"] < 64 * 1024
+    assert [entry["output"]["file"] for entry in outputs.values()] == [
+        f"out/{number}/output" for number in range(1, 6)
+    ]
+    assert printed(work, outputs["samples/ok"]) == "42\n"
+    assert printed(work, outputs["main/fail"]) == "partial\n"
+    for entry in outputs.values():
+        assert set(entry) == {"output", "time_ms", "memory_kb", "outcome"}
+        assert isinstance(entry["time_ms"], int)
+        assert isinstance(entry["memory_kb"], int)
+        assert entry["memory_kb"] > 0
+    assert outputs["main/grow"]["memory_kb"] > 64 * 1024
+    assert outputs["samples/ok"]["memory_kb"] < 64 * 1024
     assert not list(work.glob(".sandbox-run-*"))
+
+
+def test_a_run_stopped_at_its_time_limit_reports_at_least_the_limit(
+    run: Any,
+) -> None:
+    """Stopped by the CPU limit or by the wall clock, a run reports at least
+    the time limit, though one that slept used next to no CPU.
+    """
+    items = [("main/spin", "spin\n"), ("main/sleep", "sleep\n")]
+    outputs = by_test(run(items, time_limit=0.3))
+    assert outputs["main/spin"]["outcome"] == "time_limit"
+    assert outputs["main/sleep"]["outcome"] == "time_limit"
+    assert 300 <= outputs["main/spin"]["time_ms"] < 1300
+    assert outputs["main/sleep"]["time_ms"] == 300
+
+
+@pytest.mark.parametrize(
+    ("args", "argv"),
+    [
+        ("--seed 7", ["--seed", "7"]),
+        (
+            "  --threshold   0.5 --heuristic true ",
+            ["--threshold", "0.5", "--heuristic", "true"],
+        ),
+        ("", []),
+        (None, []),
+    ],
+)
+def test_args_reach_the_command_line_split_on_spaces(
+    run: Any, tmp_path: Path, args: str | None, argv: list[str]
+) -> None:
+    """`args` is appended to the binary's command line, split on spaces, with
+    no empty arguments; absent, the binary gets none.
+    """
+    given = {"main/1": args} if args is not None else None
+    outputs = by_test(run([("main/1", "argv\n")], args=given))
+    assert outputs["main/1"]["outcome"] == "accepted"
+    assert printed(tmp_path / "work", outputs["main/1"]) == f"{argv!r}\n"
+
+
+def test_args_are_each_items_own(run: Any, tmp_path: Path) -> None:
+    items = [("main/1", "argv\n"), ("main/2", "argv\n"), ("main/3", "argv\n")]
+    outputs = by_test(run(items, args={"main/1": "a b", "main/3": "c"}))
+    work = tmp_path / "work"
+    assert [printed(work, outputs[test]) for test, _ in items] == [
+        "['a', 'b']\n",
+        "[]\n",
+        "['c']\n",
+    ]
+
+
+def test_args_no_command_line_can_carry_are_a_runtime_error(
+    run: Any, tmp_path: Path
+) -> None:
+    """An argument holding a NUL character, or longer than the kernel takes,
+    is the contestant's input failing, never an error of the step.
+    """
+    items = [("main/nul", "argv\n"), ("main/long", "argv\n"), ("main/ok", "argv\n")]
+    args = {"main/nul": "a \0 b", "main/long": "x" * (256 * 1024)}
+    outputs = by_test(run(items, args=args))
+    assert {test: entry["outcome"] for test, entry in outputs.items()} == {
+        "main/nul": "runtime_error",
+        "main/long": "runtime_error",
+        "main/ok": "accepted",
+    }
+    for entry in outputs.values():
+        assert set(entry) == {"output", "time_ms", "memory_kb", "outcome"}
+    assert printed(tmp_path / "work", outputs["main/nul"]) == ""
 
 
 def test_output_over_the_limit(run: Any, tmp_path: Path) -> None:
     """Printing too much is an output limit, and the output is cut at the limit."""
-    result = run([("flood", "flood\n")], time_limit=10)
-    assert by_id(result)["flood"]["outcome"] == "output_limit"
-    output = tmp_path / "work" / "out" / "flood" / "output"
+    result = run([("main/flood", "flood\n")], time_limit=10)
+    assert by_test(result)["main/flood"]["outcome"] == "output_limit"
+    output = tmp_path / "work" / "out" / "1" / "output"
     assert output.stat().st_size == sandbox_run.OUTPUT_LIMIT
 
 
 def test_processes_left_behind_are_killed(run: Any) -> None:
     """A process a run leaves behind, even in its own session, is killed."""
-    result = run([("linger", "linger\n")])
-    assert by_id(result)["linger"]["outcome"] == "accepted"
+    result = run([("main/linger", "linger\n")])
+    assert by_test(result)["main/linger"]["outcome"] == "accepted"
     assert sandbox_run.child_pids() == []
 
 
 def test_runs_write_only_their_own_directory(run: Any, tmp_path: Path) -> None:
     """A run cannot write the working directory or the rest of /tmp."""
     work = tmp_path / "work"
-    run([("escape", f"escape\n{work}\n")])
-    lines = (work / "out" / "escape" / "output").read_text().splitlines()
+    run([("main/escape", f"escape\n{work}\n")])
+    lines = (work / "out" / "1" / "output").read_text().splitlines()
     assert lines == [
         f"refused {work}/escaped 13",
         f"refused {work}/inputs.json 13",
@@ -236,11 +327,11 @@ def test_a_run_that_kills_its_launcher_is_a_runtime_error(
     the program measured itself. Either way it is the run's own runtime
     error, never an error of the step.
     """
-    result = run([("parricide", "parricide\n"), ("ok", "double\n21\n")])
-    outputs = by_id(result)
-    assert outputs["parricide"]["outcome"] == "runtime_error"
-    assert outputs["ok"]["outcome"] == "accepted"
-    said = (tmp_path / "work" / "out" / "parricide" / "output").read_text().splitlines()
+    result = run([("main/parricide", "parricide\n"), ("main/ok", "double\n21\n")])
+    outputs = by_test(result)
+    assert outputs["main/parricide"]["outcome"] == "runtime_error"
+    assert outputs["main/ok"]["outcome"] == "accepted"
+    said = printed(tmp_path / "work", outputs["main/parricide"]).splitlines()
     if sandbox_run.landlock_abi() >= 6:
         assert said == [f"refused {errno.EPERM}"]
 
@@ -251,9 +342,9 @@ def test_a_run_that_stops_its_launcher_is_still_ended_on_time(run: Any) -> None:
     within a second or so of that, not after a long wait for the helper.
     """
     started = time.monotonic()
-    result = run([("freeze", "freeze\n")], time_limit=0.5)
+    result = run([("main/freeze", "freeze\n")], time_limit=0.5)
     elapsed = time.monotonic() - started
-    assert by_id(result)["freeze"]["outcome"] == "time_limit"
+    assert by_test(result)["main/freeze"]["outcome"] == "time_limit"
     assert elapsed < 4
 
 
@@ -264,7 +355,12 @@ def test_a_run_the_kernel_killed_for_memory_is_over_the_memory_limit(
     events.write_text("low 0\nhigh 0\nmax 3\noom 1\noom_kill 2\n")
     monkeypatch.setattr(sandbox_run, "OOM_EVENTS", events)
     item = sandbox_run.Item(
-        "x", tmp_path / "binary", tmp_path / "input", time_limit=1.0, memory_limit=64
+        "main/x",
+        1,
+        tmp_path / "binary",
+        tmp_path / "input",
+        time_limit=1.0,
+        memory_limit=64,
     )
     run = sandbox_run.Run(-9, 0.1, 0.2, 1000, 0, None, out_of_memory=True)
 
@@ -274,27 +370,27 @@ def test_a_run_the_kernel_killed_for_memory_is_over_the_memory_limit(
 
 def test_work_in_a_child_counts_against_the_time_limit(run: Any) -> None:
     """A child the binary never waits for still spends the run's time."""
-    result = run([("hidden-work", "hidden-work\n")], time_limit=0.5)
-    outputs = by_id(result)
-    assert outputs["hidden-work"]["outcome"] == "time_limit"
-    assert outputs["hidden-work"]["time_ms"] >= 500
+    result = run([("main/hidden-work", "hidden-work\n")], time_limit=0.5)
+    outputs = by_test(result)
+    assert outputs["main/hidden-work"]["outcome"] == "time_limit"
+    assert outputs["main/hidden-work"]["time_ms"] >= 500
 
 
 def test_memory_in_a_child_counts_against_the_memory_limit(run: Any) -> None:
-    result = run([("hidden-memory", "hidden-memory\n")], memory_limit=64)
-    outputs = by_id(result)
-    assert outputs["hidden-memory"]["outcome"] == "memory_limit"
-    assert outputs["hidden-memory"]["memory_kb"] > 64 * 1024
+    result = run([("main/hidden-memory", "hidden-memory\n")], memory_limit=64)
+    outputs = by_test(result)
+    assert outputs["main/hidden-memory"]["outcome"] == "memory_limit"
+    assert outputs["main/hidden-memory"]["memory_kb"] > 64 * 1024
 
 
 def test_memory_spread_over_processes_is_added_up(run: Any) -> None:
     """Two processes that each hold 40 MB of their own at the same moment are
     over a 64 MB limit together, though each alone is under it.
     """
-    result = run([("split", "split-memory\n")], time_limit=3, memory_limit=64)
-    outputs = by_id(result)
-    assert outputs["split"]["outcome"] == "memory_limit"
-    assert outputs["split"]["memory_kb"] > 64 * 1024
+    result = run([("main/split", "split-memory\n")], time_limit=3, memory_limit=64)
+    outputs = by_test(result)
+    assert outputs["main/split"]["outcome"] == "memory_limit"
+    assert outputs["main/split"]["memory_kb"] > 64 * 1024
 
 
 def test_a_forked_child_is_not_charged_again_for_what_it_shares(run: Any) -> None:
@@ -302,12 +398,13 @@ def test_a_forked_child_is_not_charged_again_for_what_it_shares(run: Any) -> Non
     own, costs the run almost nothing: the pages it shares with its parent
     count once, not once in each process.
     """
-    items = [("alone", "hold-memory\n"), ("shared", "shared-memory\n")]
-    outputs = by_id(run(items, time_limit=3, memory_limit=64))
-    assert outputs["alone"]["outcome"] == "accepted"
-    assert outputs["shared"]["outcome"] == "accepted"
-    assert outputs["alone"]["memory_kb"] > 40 * 1024
-    assert outputs["shared"]["memory_kb"] < outputs["alone"]["memory_kb"] + 4 * 1024
+    items = [("main/alone", "hold-memory\n"), ("main/shared", "shared-memory\n")]
+    outputs = by_test(run(items, time_limit=3, memory_limit=64))
+    alone, shared = outputs["main/alone"], outputs["main/shared"]
+    assert alone["outcome"] == "accepted"
+    assert shared["outcome"] == "accepted"
+    assert alone["memory_kb"] > 40 * 1024
+    assert shared["memory_kb"] < alone["memory_kb"] + 4 * 1024
 
 
 def test_what_the_cgroup_holds_beyond_the_start_of_a_run_counts(tmp_path: Path) -> None:
@@ -346,9 +443,9 @@ def test_a_run_outside_a_cgroup_of_its_own_is_warned_about(
     """
     assert sandbox_run.own_cgroup() is None
 
-    outputs = by_id(run([("ok", "double\n21\n")]))
+    outputs = by_test(run([("main/ok", "double\n21\n")]))
 
-    assert outputs["ok"]["outcome"] == "accepted"
+    assert outputs["main/ok"]["outcome"] == "accepted"
     assert sandbox_run.NO_CGROUP in capsys.readouterr().err
 
 
@@ -387,10 +484,12 @@ def test_a_native_binary_the_kernel_will_not_run_is_a_runtime_error(
     helper: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(sandbox_run, "HELPER", helper)
-    batch_inputs(tmp_path, b"\x7fELF" + bytes(60), [("1", "")])
+    batch_inputs(tmp_path, b"\x7fELF" + bytes(60), [("main/1", "")])
     sandbox_run.main(["sandbox-run", str(tmp_path)])
     result = json.loads((tmp_path / "outputs.json").read_text())
-    assert by_id(result)["1"]["outcome"] == "runtime_error"
+    outputs = by_test(result)["main/1"]
+    assert outputs["outcome"] == "runtime_error"
+    assert (outputs["time_ms"], outputs["memory_kb"]) == (0, 0)
 
 
 def test_the_report_reads_only_the_lines_sandbox_exec_writes() -> None:
@@ -402,10 +501,10 @@ def test_a_json_file_is_written_whole_past_a_planted_link(tmp_path: Path) -> Non
     target = tmp_path / "elsewhere"
     target.write_text("untouched")
     (tmp_path / "outputs.json.partial").symlink_to(target)
-    sandbox_run.write_json(tmp_path / "outputs.json", {"schema_version": 4})
+    sandbox_run.write_json(tmp_path / "outputs.json", {"schema_version": 5})
     assert target.read_text() == "untouched"
     assert not (tmp_path / "outputs.json").is_symlink()
-    assert json.loads((tmp_path / "outputs.json").read_text()) == {"schema_version": 4}
+    assert json.loads((tmp_path / "outputs.json").read_text()) == {"schema_version": 5}
 
 
 def test_a_run_reads_neither_another_runs_files_nor_the_steps(
@@ -416,11 +515,11 @@ def test_a_run_reads_neither_another_runs_files_nor_the_steps(
     leaves reaches the next; the system's files it can.
     """
     work = str(tmp_path / "work")
-    result = run([("first", "double\n21\n"), ("peek", peek_input(work))])
-    outputs = by_id(result)
-    assert outputs["peek"]["outcome"] == "accepted"
-    assert (tmp_path / "work" / "out" / "first" / "output").read_text() == "42\n"
-    lines = (tmp_path / "work" / "out" / "peek" / "output").read_text().splitlines()
+    result = run([("main/first", "double\n21\n"), ("main/peek", peek_input(work))])
+    outputs = by_test(result)
+    assert outputs["main/peek"]["outcome"] == "accepted"
+    assert printed(tmp_path / "work", outputs["main/first"]) == "42\n"
+    lines = printed(tmp_path / "work", outputs["main/peek"]).splitlines()
     assert lines == peeked(work)
 
 
@@ -431,7 +530,7 @@ def test_without_landlock_nothing_runs(
     the step, never a run left unconfined.
     """
     monkeypatch.setattr(sandbox_run, "landlock_abi", lambda: 0)
-    result = run([("ok", "double\n21\n")])
+    result = run([("main/ok", "double\n21\n")])
     assert set(result) == {"schema_version", "error"}
     assert "Landlock" in result["error"]
     assert "5.13" in result["error"]
@@ -444,7 +543,7 @@ def test_a_ruleset_the_kernel_refuses_is_an_error(
         raise OSError(1, "Operation not permitted")
 
     monkeypatch.setattr(sandbox_run, "landlock_ruleset", refuse)
-    result = run([("ok", "double\n21\n")])
+    result = run([("main/ok", "double\n21\n")])
     assert "could not be confined with Landlock" in result["error"]
 
 
