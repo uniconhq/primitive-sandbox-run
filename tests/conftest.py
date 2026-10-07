@@ -4,7 +4,8 @@ The image tests build the image from this checkout (or use the one named by
 `PRIMITIVE_IMAGE`) and start it with the flags every step container gets: no
 network, a read-only root, every capability dropped, no new privileges,
 Docker's built-in seccomp profile, user 65532, no swap, the declared memory
-and pids limits, one CPU, a small noexec tmpfs at /tmp and the working
+and pids limits, the CPU-time and file-size limits as `RLIMIT_CPU` and
+`RLIMIT_FSIZE`, one CPU, a small noexec tmpfs at /tmp and the working
 directory at /work. They are skipped when Docker is not reachable.
 
 The contract checks use `primitive.schema.json` from `PRIMITIVE_SCHEMA`, or
@@ -24,6 +25,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -74,7 +76,13 @@ def run_image(image: str) -> RunImage:
     apart from one open to the next.
     """
 
-    def run(work: Path, limits: dict[str, int] | None = None) -> dict[str, Any]:
+    def run(
+        work: Path,
+        limits: dict[str, int] | None = None,
+        seconds: list[float] | None = None,
+    ) -> dict[str, Any]:
+        """Run the batch in `work`; `seconds`, when given, gets how long the
+        sandboxed container took, from `docker run` to its exit."""
         limits = limits or declaration()["limits"]
         open_up(work)
         volume = f"{NAME}-test-{secrets.token_hex(4)}"
@@ -97,9 +105,12 @@ def run_image(image: str) -> RunImage:
                 )
                 command = ["docker", "run", "--rm", *sandbox_flags(limits)]
                 command += ["--volume", f"{volume}:/work", image]
+                started = time.monotonic()
                 subprocess.run(
                     command, check=True, timeout=limits["time_ms"] / 1000 + 60
                 )
+                if seconds is not None:
+                    seconds.append(time.monotonic() - started)
                 docker("cp", f"{holder}:/work/.", str(work))
             finally:
                 docker("rm", "--force", holder)
@@ -170,7 +181,9 @@ def compile_once(
     """Run the compile image once over `work` with `document` as inputs.json."""
     (work / "inputs.json").write_text(json.dumps(document))
     open_up(work)
-    flags = sandbox_flags({"memory_mb": 1024, "pids": 128})
+    flags = sandbox_flags(
+        {"cpu_ms": 60000, "memory_mb": 1024, "pids": 128, "output_mb": 64}
+    )
     command = ["docker", "run", "--rm", *flags, "--volume", f"{work}:/work"]
     subprocess.run([*command, compile_image], check=True, timeout=120)
     result: dict[str, Any] = json.loads(

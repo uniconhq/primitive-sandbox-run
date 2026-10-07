@@ -143,6 +143,26 @@ def test_python_runs_reach_every_outcome(
     ]
 
 
+def test_a_batch_stopped_by_the_wall_clock_fits_its_time(
+    tmp_path: Path, run_image: RunImage
+) -> None:
+    """A batch whose every run sleeps until the wall clock stops it, the
+    longest a test can take, ends within the time the declaration gives the
+    batch, counted from `docker run` to the container's exit, so a contestant
+    cannot make the harness kill the container.
+    """
+    binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()
+    work = tmp_path / "work"
+    items = [(f"main/sleep-{number}", "sleep\n") for number in range(4)]
+    batch_inputs(work, binary, items, 1.0, 64)
+    limits = container_limits(1.0, 64, len(items))
+    seconds: list[float] = []
+    outputs = by_test(run_image(work, limits, seconds))
+    assert {entry["outcome"] for entry in outputs.values()} == {"time_limit"}
+    assert {entry["time_ms"] for entry in outputs.values()} == {1000}
+    assert seconds[0] < limits["time_ms"] / 1000
+
+
 def test_output_over_the_limit_is_cut(tmp_path: Path, run_image: RunImage) -> None:
     """Printing past the output limit is `output_limit`, with the output cut there."""
     binary = python_binary(tmp_path / "build" / "binary", PROGRAM).read_bytes()

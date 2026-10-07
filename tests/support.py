@@ -49,6 +49,8 @@ def container_limits(
 def sandbox_flags(limits: dict[str, int]) -> list[str]:
     """The docker run flags the harness gives a step container."""
     memory = f"{limits['memory_mb']}m"
+    cpu_seconds = math.ceil(limits["cpu_ms"] / 1000)
+    file_bytes = limits["output_mb"] * 1024 * 1024
     return [
         "--network=none",
         "--read-only",
@@ -59,6 +61,8 @@ def sandbox_flags(limits: dict[str, int]) -> list[str]:
         f"--memory={memory}",
         f"--memory-swap={memory}",
         f"--pids-limit={limits['pids']}",
+        f"--ulimit=cpu={cpu_seconds}:{cpu_seconds}",
+        f"--ulimit=fsize={file_bytes}:{file_bytes}",
         "--cpus=1",
         "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=64m",
     ]
