@@ -205,15 +205,29 @@ exits, because `/tmp` may be mounted `noexec`.
 
 ## The container's limits
 
-`limits` in `primitive.yaml` are per test: 5 s of time and CPU, 256 MB of
+`limits` in `primitive.yaml` are per test: 2 s of time and CPU, 256 MB of
 memory, 128 processes, 64 MB of output and no GPUs, with no network
-(`network: false`). `limits_from` raises them from
-each test's own limits so the container never dies before the program's own
-limit does: time and CPU to `2 × time_limit + 3` seconds (the wall-clock
-limit plus room to start and clean up), and memory to `memory_limit + 256` MB
-(room for the program itself and for the moment between two memory
-readings). The `forge` repo's compiler adds up time and CPU over the tests
-of the batch when it writes the plan.
+(`network: false`). `limits_from` raises them from each test's own limits
+so the container never dies before the program's own limit does, and they
+are raised for every test, since every test has a `time_limit`. Time and
+CPU go to `2 × time_limit + 3` seconds, what one test can take at most:
+
+- the wall-clock limit, `2 × time_limit + 1` seconds, which a run that
+  sleeps or waits reaches;
+- up to one second more when a run keeps `sandbox-exec` from reporting,
+  before its whole process group is killed (see "Limits and outcomes");
+- and about a second for the rest: starting the run under Landlock, reaping
+  what it left behind and removing its directory, and this program's own
+  start, once per batch. A sleeping run took 0.2 to 0.6 s beyond the
+  wall-clock limit per test, and a batch 1.5 to 2 s to start, measured in
+  the image under the harness's flags with one CPU on a loaded laptop.
+
+Memory goes to `memory_limit + 256` MB (room for the program itself and for
+the moment between two memory readings). The `forge` repo's compiler adds up
+time and CPU over the tests of the batch when it writes the plan. The
+harness holds the CPU limit as `RLIMIT_CPU` on the container's processes,
+this program among them, and each run lowers its own to the time limit
+rounded up plus a second, which is always below it.
 
 ## The binary format
 
