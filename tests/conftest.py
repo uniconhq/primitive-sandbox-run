@@ -157,15 +157,15 @@ def compiled(compile_image: str, tmp_path_factory: pytest.TempPathFactory) -> Co
     """
 
     def build(language: str, name: str, source: str) -> bytes:
-        work = tmp_path_factory.mktemp("compile")
-        folder = work / "in" / "1" / "source"
-        folder.mkdir(parents=True)
-        (folder / name).write_text(source)
+        work = source_in(tmp_path_factory, name, source)
         inputs = {"source": {"folder": "in/1/source"}, "language": language}
         result = compile_once(
             compile_image, work, {"schema_version": SCHEMA_VERSION, "inputs": inputs}
         )
         if "contract version" in result.get("error", ""):
+            # A directory of its own: what the first run wrote belongs to the
+            # container's user, which this one cannot open up again.
+            work = source_in(tmp_path_factory, name, source)
             inputs = {"source": {"file": f"in/1/source/{name}"}, "language": language}
             document = {"schema_version": 4, "inputs": inputs}
             result = compile_once(compile_image, work, document)
@@ -173,6 +173,15 @@ def compiled(compile_image: str, tmp_path_factory: pytest.TempPathFactory) -> Co
         return (work / str(result["outputs"]["binary"]["file"])).read_bytes()
 
     return build
+
+
+def source_in(factory: pytest.TempPathFactory, name: str, source: str) -> Path:
+    """A fresh working directory holding the source as `in/1/source/<name>`."""
+    work = factory.mktemp("compile")
+    folder = work / "in" / "1" / "source"
+    folder.mkdir(parents=True)
+    (folder / name).write_text(source)
+    return work
 
 
 def compile_once(
